@@ -1,0 +1,47 @@
+# One-way (DAS -> streamer) variant.  Used by
+# `python -m train.train_pohang_shore_oneway` and by
+# `python -m inference.test_pohang_shore`.
+TAG: "pohang_shore_das_str_oneway"
+CUDNN_BENCHMARK: True
+SEED: 19467
+DEVICE: "cuda"
+GPUS: [ 0 ]
+
+PRETRAIN:
+  LOAD: False
+  TAG: "pohang_shore_das_str_oneway"
+  LOAD_EPOCH: 0
+  LOAD_OPTIMIZER: True
+
+DATASET:
+  CROP_SIZE: [ 512, 72 ]
+  NUM_DATA: 2800
+  NOISE: 0.05
+  NOISE_DECAY: 0.98
+
+MODEL:
+  A_CHANNELS: 1        # DAS
+  B_CHANNELS: 1        # streamer
+  GEN_CHANNELS: 32
+  GEN_NORM: True
+  GEN_SPEC: False
+  GEN_CBAM: True
+  DIS_CHANNELS: 32
+  DIS_NORM: False
+  DIS_SPEC: True
+  DIS_CBAM: True
+
+TRAIN:
+  BATCH_SIZE: 4
+  ITER_PER_EPOCH: 1
+  BEGIN_EPOCH: 0
+  END_EPOCH: 200
+  CHECK_EPOCH: 10
+  GEN_LR: 0.0001
+  DIS_LR: 0.0002
+  BETA1: 0.5
+  BETA2: 0.99
+  LAMBDA_I: 1.0
+  LAMBDA_C: 5.0
+  LAMBDA_ADV: 0.05
+  LAMBDA_SSIM: 1.0

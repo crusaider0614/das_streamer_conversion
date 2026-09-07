@@ -1,0 +1,49 @@
+# Two-way CycleGAN between Pohang DAS (domain A) and streamer (domain B) shot
+# gathers.  Used by `python -m train.train_pohang_shore`.
+TAG: "pohang_shore_das_str"
+CUDNN_BENCHMARK: True
+SEED: 19467
+DEVICE: "cuda"
+GPUS: [ 0 ]
+
+PRETRAIN:
+  LOAD: False
+  TAG: "pohang_shore_das_str"
+  LOAD_EPOCH: 0
+  LOAD_OPTIMIZER: True
+
+DATASET:
+  # CROP_SIZE is [n_time, n_trace]; only the time axis is actually cropped, the
+  # trace axis is taken whole (72 DAS channels, all streamer channels).
+  CROP_SIZE: [ 512, 72 ]
+  NUM_DATA: 2800
+  # Instance noise fed to the discriminators, annealed once per epoch.
+  NOISE: 0.05
+  NOISE_DECAY: 0.98
+
+MODEL:
+  A_CHANNELS: 1        # DAS
+  B_CHANNELS: 1        # streamer
+  GEN_CHANNELS: 32
+  GEN_NORM: True
+  GEN_SPEC: False
+  GEN_CBAM: True
+  DIS_CHANNELS: 32
+  DIS_NORM: False      # hinge WGAN discriminator - keep it norm-free
+  DIS_SPEC: True
+  DIS_CBAM: True
+
+TRAIN:
+  BATCH_SIZE: 4
+  ITER_PER_EPOCH: 1
+  BEGIN_EPOCH: 0
+  END_EPOCH: 200
+  CHECK_EPOCH: 10
+  GEN_LR: 0.0001
+  DIS_LR: 0.0002
+  BETA1: 0.5
+  BETA2: 0.99
+  LAMBDA_I: 1.0        # identity loss
+  LAMBDA_C: 5.0        # cycle-consistency loss
+  LAMBDA_ADV: 0.05     # adversarial / reconstruction mixing ratio
+  LAMBDA_SSIM: 1.0     # 0.0 disables the SSIM term

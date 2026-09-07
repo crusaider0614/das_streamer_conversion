@@ -1,0 +1,16 @@
+# PyTorch is not pinned here — install the build that matches your CUDA
+# version from https://pytorch.org/get-started/locally/ first, e.g.:
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+
+numpy
+# process/make_pohang.py calls scipy.signal.ricker, deprecated in SciPy 1.12
+# and removed in 1.15. Drop the ceiling once that call is replaced.
+scipy<1.15
+matplotlib
+PyYAML
+segyio
+yacs==0.1.8
+
+# process/make_pohang.py only
+scikit-image
+joblib

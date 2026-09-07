@@ -1,0 +1,48 @@
+# CUT (contrastive unpaired translation) variant on the anisotropic generator.
+# Used by `python -m train.train_pohang_shore_cut` and by
+# `python -m inference.test_pohang_cut` / `test_pohang_cut_compare`.
+TAG: "pohang_shore_das_str_cut"
+CUDNN_BENCHMARK: True
+SEED: 19467
+DEVICE: "cuda"
+GPUS: [ 0 ]
+
+PRETRAIN:
+  LOAD: False
+  TAG: "pohang_shore_das_str_cut"
+  LOAD_EPOCH: 0
+  LOAD_OPTIMIZER: True
+
+DATASET:
+  CROP_SIZE: [ 512, 72 ]
+  NUM_DATA: 2800
+  NOISE: 0.05
+  NOISE_DECAY: 0.98
+
+MODEL:
+  A_CHANNELS: 1        # DAS
+  B_CHANNELS: 1        # streamer
+  OUT_CHANNELS: 1
+  GEN_CHANNELS: 32
+  GEN_NORM: True
+  GEN_SPEC: False
+  GEN_CBAM: True
+  DIS_CHANNELS: 32
+  DIS_NORM: False
+  DIS_SPEC: True
+  DIS_CBAM: True
+
+TRAIN:
+  BATCH_SIZE: 4
+  ITER_PER_EPOCH: 1
+  BEGIN_EPOCH: 0
+  END_EPOCH: 200
+  CHECK_EPOCH: 10
+  GEN_LR: 0.0001
+  DIS_LR: 0.0002
+  BETA1: 0.5
+  BETA2: 0.99
+  LAMBDA_I: 1.0        # identity loss
+  LAMBDA_ADV: 1.0      # adversarial loss
+  LAMBDA_N: 1.0        # PatchNCE loss
+  LAMBDA_SSIM: 1.0

@@ -1,0 +1,39 @@
+# Data and trained weights are not tracked; the directories the code expects
+# are kept (empty, via .gitkeep) so the layout exists right after a clone.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+checkpoint/*
+!checkpoint/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDEs / editors / local tooling
+.vscode/
+.idea/
+.claude/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+*.npy
+*.bin
+*.segy
+
+# Reference material, not part of this project's code
+hj_code/
+
+# Binary assets and figures
+*.mat
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.iml
+*~
