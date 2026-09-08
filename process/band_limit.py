@@ -1,7 +1,7 @@
 """Band-limit the streamer array before the trace interpolation.
 
     numpy/str_data_raw.npy  (551, 8000, 24) @ 0.5 ms
-    numpy/str_data_bl.npy   (551, 7000, 24) @ 0.5 ms
+    numpy/str_data_bl.npy   (551, 4000, 24) @ 0.5 ms
 
 The `raw -> bl` stage.  Separate from `process/freq_filter.py`, which is the
 `geom -> freq` stage at the far end of the pipeline: this one runs on the
@@ -22,8 +22,8 @@ replica survives in the output as a false event near k = 0.45 cycles/m.
 The direct arrival is the steepest thing here, and cross-correlating adjacent
 traces puts it at 3.1 samples of 0.5 ms per trace - 1950 m/s, not the 1500 m/s
 a marine gather is usually assumed to hold.  That gives 300 Hz at the widest
-gap, which is where LP_F_CUT now sits.  It was 220 Hz on the 1500 m/s
-assumption, which the data does not support.
+gap.  LP_F_CUT sits at 250 Hz, under that with margin.  It was 220 Hz on the
+1500 m/s assumption, which the data does not support.
 
 Aliasing is not a cliff, though.  Measured against the DAS - 0.75 m sampling
 over the same aperture, so four times the Nyquist and able to see what the
@@ -36,9 +36,14 @@ The crop
 --------
 f_filtering transforms the whole trace at once, so the filter is circular.
 PAD_FRONT zeros absorb the wrap and CROP_TOP removes them again, leaving the
-time origin unchanged.  CROP_BOTTOM additionally drops the last 1000 samples of
-the record: 8000 + 2000 - 2000 - 1000 = 7000, which is what str_data_intp.npy
-holds and therefore what a rerun has to reproduce.
+time origin unchanged.  OUT_SAMPLES then keeps the front of the record and
+throws the rest away: 4000 samples, 2000 ms.
+
+2000 ms is the window the training arrays keep - see config.NORM_SAMPLES - so
+the record now carries nothing the dataset will not use.  It lines up all the
+way down: 4000 at 0.5 ms interpolates to 4000, decimates 2:1 to 2000 at 1 ms,
+and config.NORM_SAMPLES crops 2000, which makes that last crop a no-op.  It
+also takes about 40 % off the interpolation, which is the expensive stage.
 
 Edit the settings block below, then run from the repository root:
 
@@ -56,7 +61,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 import config as C  # noqa: E402
 from utils.data import create_memmap, get_project_root  # noqa: E402
-from utils.process import f_filter, f_filtering  # noqa: E402
+from utils.process import f_filter, f_filtering, fk_filter  # noqa: E402
 from utils import mute as MU  # noqa: E402
 
 # ---------------------------------------------------------------- settings --
@@ -68,7 +73,7 @@ OUTPUT_NPY = C.ARRAYS["str"]["bl"]
 # SEG-Y's own grid, not the 1 ms one the rest of the pipeline uses.
 DT_US = 500
 
-# The filter comes from config.FILTER_PARAMS["str"] - the single place the
+# The filter comes from config.FILTER_PARAMS["str_bl"] - the single place the
 # streamer band is defined.  process/decimate_intp.py imports these names from
 # here for its anti-alias pass, and process/rms_normalize.py records the same
 # config entry in the sidecar, so all three agree by construction.  Change the
@@ -84,14 +89,29 @@ HP_ORDER = _F["hp_order"]
 HP_DECAY = _F["hp_decay"]
 ZERO_DC = _F["zero_dc"]
 
-# 8000 + 2000 - 2000 - 1000 = 7000 output samples.  See the docstring.
+# PAD_FRONT zeros go on the front, CROP_TOP takes them off again, and
+# OUT_SAMPLES of record are kept from there.  See the docstring.
 PAD_FRONT = 2000
 CROP_TOP = 2000
-CROP_BOTTOM = 1000
+OUT_SAMPLES = 4000
 
-# Trace spacing, for the alias-onset reference numbers.
-DX_M = 3.1196
+# Mean recorded-node spacing: the 24 nodes span the same 71.25 m the 93
+# interpolated traces do.  It sets the f-k mask's velocity axis as well as the
+# alias-onset reference lines, so it is derived rather than typed - the 3.1196
+# that used to sit here was 0.7 % out.
+DX_M = C.STR_TRACE_INTERVAL_M * (C.STR_TRACES - 1) / (C.STR_NODES - 1)
 VELOCITIES = [1500.0, 2000.0]
+
+# f-k fan filter, from config.FK_PARAMS.  Runs after the band-pass and before
+# the mute, on the time-padded array, so it shares PAD_FRONT's protection
+# against the circular wrap in time and adds its own in the trace direction.
+_K = C.FK_PARAMS
+FK_FILTER = _K["enabled"]
+FK_V_CUT = _K["v_cut"]
+FK_ORDER = _K["order"]
+FK_DECAY = _K["decay"]
+FK_IS_LOWPASS = _K["is_lowpass"]
+FK_TRACE_PAD = _K["trace_pad"]
 
 # Mute ahead of the direct arrival on the way out.  Doing it here rather
 # than later is the point: the interpolation never sees the pre-arrival
@@ -113,6 +133,52 @@ CLIP_PERC = 99.0
 
 def resolve(path):
     return path if os.path.isabs(path) else os.path.join(get_project_root(), path)
+
+
+def pad_x(g, p):
+    """Tapered pad on both ends of the trace axis.
+
+    The 2-D transform is periodic in x as well as t, so with a live event
+    running to the last trace the wrap from trace 23 back to trace 0 is a step,
+    and it smears across the whole f-k plane.  The pad holds the edge trace
+    faded to zero by a raised cosine, and is cropped off again afterwards.
+    """
+    if p <= 0:
+        return g
+    t = np.arange(1, p + 1) / p
+    w = 0.5 * (1.0 + np.cos(np.pi * t))
+    return np.concatenate([g[:, :1] * w[::-1][None, :], g,
+                           g[:, -1:] * w[None, :]], axis=1)
+
+
+def build_fk_mask(nt, nx, dt):
+    return fk_filter(nt, nx, dt, DX_M, FK_V_CUT, FK_ORDER, FK_DECAY,
+                     is_lowpass=FK_IS_LOWPASS)
+
+
+def fk_apply(y, m, p):
+    nx = y.shape[1]
+    out = np.fft.ifft2(np.fft.fft2(pad_x(y, p)) * m)
+    return np.real(out)[:, p:p + nx]
+
+
+def report_fk(m, nt, nx, dt):
+    """The mask read back along the velocity axis, and what it keeps."""
+    f = np.fft.fftfreq(nt, dt)[:, None]
+    k = np.fft.fftfreq(nx, DX_M)[None, :]
+    v = np.abs(f / (k + 1e-10))
+    print(f"  f-k fan: v_cut {FK_V_CUT:g} m/s, order {FK_ORDER:g}, "
+          f"decay {FK_DECAY:g}, "
+          + ("keeping fast" if not FK_IS_LOWPASS else "keeping slow")
+          + f", trace pad {FK_TRACE_PAD}")
+    print("    response:")
+    for probe in (500, 1000, 1200, 1300, 1400, 1500, 1600, 1800, 2000, 3000):
+        sel = np.abs(v - probe) < 25.0
+        if not sel.any():
+            continue
+        a = float(np.median(m[sel]))
+        print(f"      {probe:>5} m/s: {a:9.6f}  "
+              f"({20 * np.log10(max(a, 1e-300)):8.2f} dB)")
 
 
 def build_mask(nt, dt):
@@ -204,16 +270,17 @@ def main():
     dt = DT_US * 1e-6
 
     nt_pad = nt + PAD_FRONT
-    if CROP_TOP + CROP_BOTTOM >= nt_pad:
-        raise SystemExit(f"crops {CROP_TOP} + {CROP_BOTTOM} leave nothing of "
-                         f"the {nt_pad} padded samples")
-    keep = slice(CROP_TOP, nt_pad - CROP_BOTTOM)
-    nt_out = keep.stop - keep.start
+    if CROP_TOP + OUT_SAMPLES > nt_pad:
+        raise SystemExit(f"{CROP_TOP} + {OUT_SAMPLES} runs past the end of the "
+                         f"{nt_pad} padded samples")
+    keep = slice(CROP_TOP, CROP_TOP + OUT_SAMPLES)
+    nt_out = OUT_SAMPLES
 
     print(f"{INPUT_NPY}\n  {n_shots} shots x {nt} samples @ {DT_US / 1000:g} ms "
           f"x {n_traces} traces")
-    print(f"  pad {PAD_FRONT} -> filter on {nt_pad} -> crop {CROP_TOP} top / "
-          f"{CROP_BOTTOM} bottom -> {nt_out} samples")
+    print(f"  pad {PAD_FRONT} -> filter on {nt_pad} -> drop {CROP_TOP} -> keep "
+          f"{nt_out} samples ({nt_out * DT_US / 1000:g} ms of the "
+          f"{nt * DT_US / 1000:g} ms record)")
     print("  low-cut  " + (f"{HP_F_CUT:g} Hz" if HIGHPASS else "off"))
     print("  low-pass " + (f"{LP_F_CUT:g} Hz (order {LP_ORDER:g}, "
                            f"decay {LP_DECAY:g})" if LOWPASS else "off"))
@@ -221,6 +288,13 @@ def main():
     mask = build_mask(nt_pad, dt)
     if REPORT_RESPONSE:
         report(mask, nt_pad, dt)
+
+    fk_mask = None
+    if FK_FILTER:
+        nx_pad = n_traces + 2 * FK_TRACE_PAD
+        fk_mask = build_fk_mask(nt_pad, nx_pad, dt)
+        if REPORT_RESPONSE:
+            report_fk(fk_mask, nt_pad, nx_pad, dt)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     out = create_memmap(out_path, (n_shots, nt_out, n_traces))
@@ -237,7 +311,10 @@ def main():
     for i in range(n_shots):
         g = np.asarray(data[i], dtype=np.float64)
         y = f_filtering(np.concatenate([pad, g], axis=0), mask,
-                        is_zeroout=ZERO_DC)[keep]
+                        is_zeroout=ZERO_DC)
+        if fk_mask is not None:
+            y = fk_apply(y, fk_mask, FK_TRACE_PAD)
+        y = y[keep]
         if i == FIGURE_SHOT:
             raw0 = g[:FIGURE_SAMPLES].copy()
             filt0 = y[:FIGURE_SAMPLES].copy()

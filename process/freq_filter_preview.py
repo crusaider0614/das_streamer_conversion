@@ -64,10 +64,10 @@ DOMAIN = "das"
 # Per-domain input path and trace spacing.  Relative paths resolve against the
 # project root.
 SOURCES = {
-    "das": (os.path.join("data", "pohang_shore", "numpy", "das_data_geom.npy"),
+    "das": (os.path.join("data", "pohang_shore", "numpy", "das_data_line.npy"),
             0.75),
-    "str": (os.path.join("data", "pohang_shore", "numpy",
-                         "str_data_geom.npy"), 0.7745),
+    "str": (os.path.join("data", "pohang_shore", "numpy", "str_data_line.npy"),
+            0.7745),
 }
 
 # Sample interval of both arrays, in microseconds.
@@ -81,20 +81,20 @@ SHOTS = (0, 275, 550)
 # Low-cut.  Swell noise and the DAS instrument's low-frequency drift live down
 # here; 3-5 Hz is the usual starting point for marine data.
 HIGHPASS = True
-HP_F_CUT = 5.0
+HP_F_CUT = 20.0
 HP_ORDER = 1.0
 HP_DECAY = 1.0
 
 # Low-pass.  No longer an anti-alias measure (see above) - set it where the
 # signal actually ends, which the "before" spectrum will show.
 LOWPASS = True
-LP_F_CUT = 220.0
+LP_F_CUT = 300.0
 LP_ORDER = 0.5
 LP_DECAY = 0.5
 
 # Zero the DC bin outright.  Cheap way to remove a constant trace offset that
 # a finite-width low-cut leaves behind.
-ZERO_DC = True
+ZERO_DC = False
 
 # f_filtering transforms the whole trace at once, so the filter is circular:
 # without room the tail of the record wraps into its head.  PAD_FRONT zeros are
@@ -233,7 +233,7 @@ def gather_figure(panels):
             cols.append((before - after, "removed"))
         for col, (img, name) in enumerate(cols):
             ax = axes[row][col]
-            ax.imshow(img, cmap="gray", vmin=-clip, vmax=clip,
+            ax.imshow(img, cmap="seismic", vmin=-clip, vmax=clip,
                       aspect="auto", interpolation="nearest")
             ax.set_title(f"shot {shot} {name}", fontsize=9)
             ax.set_xlabel("trace")
@@ -255,7 +255,7 @@ def main():
     if not os.path.isfile(in_path):
         raise SystemExit(f"not found: {in_path}")
 
-    data = np.load(in_path, mmap_mode="r")
+    data = np.load(in_path, mmap_mode="r")[:, :2000]
     if data.ndim != 3:
         raise SystemExit(f"expected (shots, samples, traces), got {data.shape}")
     n_shots, nt, n_traces = data.shape

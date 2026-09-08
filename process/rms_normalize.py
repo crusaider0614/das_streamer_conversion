@@ -40,16 +40,37 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import config as C
+import utils.mute as MU
 from utils.data import create_memmap, get_project_root, npy_shape
 
 # ---------------------------------------------------------------- settings --
 
-# (tag, input, output).  The DAS side reads the band-passed array, the streamer
-# side the geometry array - see the note above.
+# (tag, input stage, output).  Both sides come off the `line` route now: the
+# DAS through process/decimate_receiver.py, which brought its receiver axis to
+# the streamer's 3.00 m, and the streamer straight from `line`.  Both are
+# already band-passed to 20-300 Hz and already 2000 samples at 1 ms.
 JOBS = (
-    ("das", C.ARRAYS["das"]["freq"], C.ARRAYS["das"]["norm"]),
-    ("str", C.ARRAYS["str"]["geom"], C.ARRAYS["str"]["norm"]),
+    ("das", "deci", C.ARRAYS["das"]["norm"]),
+    ("str", "line", C.ARRAYS["str"]["norm"]),
 )
+
+# Mute ahead of the direct arrival before measuring and applying the RMS.
+#
+# Here rather than earlier, and in this order, for two reasons.  Neither
+# `line` nor `deci` mutes - the mute edge is a step along the receiver axis,
+# which is not band-limited, so a filter with reach along that axis rings
+# across it and drags the direct arrival into the muted window (measured:
+# 5.36 % mean, 48.3 % p99 for the k-sinc).  Muting after both filters are
+# done avoids that entirely.
+#
+# And the mute comes before the RMS because it removes 28-37 % of the record;
+# a scale measured with that energy still in it would not put the two domains
+# on the common amplitude scale this stage exists for.
+#
+# The boundary is read from each domain's sidecar - config.META["<tag>_<stage>"]
+# - so what is applied is the boundary the geometry stage computed, on the
+# projected source positions the samples were rolled onto.
+APPLY_MUTE = True
 
 # Draw a few shots and show them.  Writes nothing.
 PREVIEW = True
@@ -66,6 +87,10 @@ SAVE_DIR = C.DATA_DIR
 
 # Sidecar parameter/measurement files.
 WRITE_META = True
+
+# Samples kept, from the start of the record; None keeps all of them.  See
+# config.NORM_SAMPLES for why 2000.
+OUT_SAMPLES = C.NORM_SAMPLES
 
 # ----------------------------------------------------------------- derived --
 
@@ -85,7 +110,57 @@ def sample_indices(n_shots):
     return np.unique(np.linspace(0, n_shots - 1, RMS_SAMPLE_SHOTS).astype(int))
 
 
-def measure_rms(data, idx):
+def crop(gather):
+    """The samples the output keeps."""
+    return gather if OUT_SAMPLES is None else gather[:OUT_SAMPLES]
+
+
+def mute_boundary(tag, stage, n_shots, n_traces):
+    """The mute boundary this input was built with, from its sidecar.
+
+    Read rather than recomputed: the samples were rolled onto projected source
+    positions, so the only boundary that matches them is the one the geometry
+    stage wrote.  Returns None when muting is off.
+    """
+    if not APPLY_MUTE:
+        return None
+    key = f"{tag}_{stage}"
+    if key not in C.META:
+        raise SystemExit(f"APPLY_MUTE is on but config.META has no {key!r}")
+    p = resolve(C.META[key])
+    if not os.path.isfile(p):
+        raise SystemExit(f"not found: {p}")
+    s = np.load(p)
+    t = s["mute_boundary_ms"]
+    if t.shape != (n_shots, n_traces):
+        raise SystemExit(f"{key} boundary is {t.shape}, the array is "
+                         f"({n_shots}, {n_traces})")
+    if "mute_applied" in s and bool(s["mute_applied"]):
+        raise SystemExit(f"{key} says its samples are ALREADY muted - muting "
+                         f"again would square the taper; set APPLY_MUTE off "
+                         f"or rebuild that stage unmuted")
+    return t
+
+
+def apply_mute(g, t_row, dt_ms):
+    """One shot, muted on the cropped grid.  A no-op when t_row is None."""
+    if t_row is None:
+        return g
+    return g * MU.weights(t_row, g.shape[0], dt_ms).astype(g.dtype)
+
+
+def mute_report(t, nt, dt_ms):
+    span = nt * dt_ms
+    frac = 100 * np.mean(np.clip(t, 0, span)) / span
+    past = 100 * (t >= span).mean()
+    return (f"mute {C.MUTE_PARAMS['velocity_m_s']:g} m/s, lead "
+            f"{C.MUTE_PARAMS['lead_ms']:g} ms, taper "
+            f"{C.MUTE_PARAMS['taper_ms']:g} ms: boundary {t.min():.0f}.."
+            f"{t.max():.0f} ms, {frac:.1f} % of the record on average"
+            + (f", {past:.1f} % of traces entirely" if past else ""))
+
+
+def measure_rms(data, idx, t_mute, dt_ms):
     """Overall RMS over the sampled shots, plus the per-shot values.
 
     A sum of squares rather than a mean of means, so the result is the true RMS
@@ -94,7 +169,8 @@ def measure_rms(data, idx):
     total, count = 0.0, 0
     per_shot = np.zeros(len(idx))
     for k, i in enumerate(idx):
-        g = np.asarray(data[i], dtype=np.float64)
+        g = apply_mute(crop(np.asarray(data[i], dtype=np.float64)),
+                       None if t_mute is None else t_mute[i], dt_ms)
         ss = float(np.sum(g ** 2))
         total += ss
         count += g.size
@@ -102,7 +178,7 @@ def measure_rms(data, idx):
     return float(np.sqrt(total / count)), per_shot
 
 
-def preview(tag, data, norm_scale):
+def preview(tag, data, norm_scale, t_mute, dt_ms):
     n_shots = data.shape[0]
     bad = [s for s in PREVIEW_SHOTS if not 0 <= s < n_shots]
     if bad:
@@ -113,7 +189,9 @@ def preview(tag, data, norm_scale):
                              figsize=(5.2 * len(PREVIEW_SHOTS), 6),
                              squeeze=False)
     for col, shot in enumerate(PREVIEW_SHOTS):
-        g = np.asarray(data[shot], dtype=np.float32) * norm_scale
+        g = apply_mute(crop(np.asarray(data[shot], dtype=np.float32)),
+                       None if t_mute is None else t_mute[shot],
+                       dt_ms) * norm_scale
         clip = np.percentile(np.abs(g), CLIP_PERC)
         clip = clip if clip > 0 else 1.0
         ax = axes[0][col]
@@ -125,7 +203,7 @@ def preview(tag, data, norm_scale):
             ax.set_ylabel("sample")
         print(f"      shot {shot:>4}: rms {np.sqrt(np.mean(g.astype(np.float64) ** 2)):.4g}, "
               f"|max| {np.abs(g).max():.4g}")
-    fig.suptitle(f"{tag}: RMS normalised to {TARGET_RMS:g} "
+    fig.suptitle(f"{tag}: muted, then RMS normalised to {TARGET_RMS:g} "
                  f"(panels clipped at {CLIP_PERC:g}%)")
     fig.tight_layout()
 
@@ -141,7 +219,7 @@ def preview(tag, data, norm_scale):
         plt.close(fig)
 
 
-def write_all(data, out_rel, norm_scale):
+def write_all(data, out_rel, norm_scale, t_mute, dt_ms):
     out_path = resolve(out_rel)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     if os.path.isfile(out_path):
@@ -150,14 +228,19 @@ def write_all(data, out_rel, norm_scale):
         del prev
 
     n_shots = data.shape[0]
-    out = create_memmap(out_path, data.shape)
+    shape = (n_shots,
+             data.shape[1] if OUT_SAMPLES is None else OUT_SAMPLES,
+             data.shape[2])
+    out = create_memmap(out_path, shape)
     print(f"    -> {out_rel}  {out.nbytes / 1e9:.2f} GB")
 
     rms_out = np.zeros(n_shots)
     lo, hi = np.inf, -np.inf
     t0 = time.time()
     for i in range(n_shots):
-        y = np.asarray(data[i], dtype=np.float32) * norm_scale
+        y = apply_mute(crop(np.asarray(data[i], dtype=np.float32)),
+                       None if t_mute is None else t_mute[i],
+                       dt_ms) * norm_scale
         out[i] = y
         rms_out[i] = np.sqrt(np.mean(y.astype(np.float64) ** 2))
         lo = min(lo, float(y.min()))
@@ -189,16 +272,27 @@ def write_meta(out_rel, tag, params, info, arrays):
 
 
 def main():
-    for tag, in_rel, out_rel in JOBS:
+    for tag, stage, out_rel in JOBS:
+        in_rel = C.ARRAYS[tag][stage]
         in_path = resolve(in_rel)
         if not os.path.isfile(in_path):
             raise SystemExit(f"not found: {in_path}")
 
         data = np.load(in_path, mmap_mode="r")
+        dt_ms = C.STAGE_DT_US[tag][stage] / 1000.0
         idx = sample_indices(data.shape[0])
-        print(f"{tag}: {in_rel}  {data.shape}")
+        kept = data.shape[1] if OUT_SAMPLES is None else OUT_SAMPLES
+        print(f"{tag}: {in_rel}  {data.shape} @ {dt_ms:g} ms"
+              + ("" if kept == data.shape[1]
+                 else f"  ->  keeping the first {kept} samples"))
 
-        rms_in, rms_in_per_shot = measure_rms(data, idx)
+        t_mute = mute_boundary(tag, stage, data.shape[0], data.shape[2])
+        if t_mute is None:
+            print(f"    APPLY_MUTE is off - no mute")
+        else:
+            print(f"    {mute_report(t_mute, kept, dt_ms)}")
+
+        rms_in, rms_in_per_shot = measure_rms(data, idx, t_mute, dt_ms)
         norm_scale = TARGET_RMS / rms_in
         print(f"    rms {rms_in:.6g} over {len(idx)} shots -> {TARGET_RMS:g}  "
               f"(scale {norm_scale:.6g})")
@@ -210,12 +304,19 @@ def main():
                   f"({100 * drift:+.4f} %, {note})")
 
         if PREVIEW:
-            preview(tag, data, norm_scale)
+            preview(tag, data, norm_scale, t_mute, dt_ms)
 
         params = dict(
             input=in_rel.replace("\\", "/"),
+            input_stage=stage,
+            muted=bool(APPLY_MUTE),
+            mute=(dict(C.MUTE_PARAMS) if APPLY_MUTE else None),
             output=out_rel.replace("\\", "/"),
-            shape=list(data.shape),
+            shape=[data.shape[0],
+                   data.shape[1] if OUT_SAMPLES is None else OUT_SAMPLES,
+                   data.shape[2]],
+            input_shape=list(data.shape),
+            out_samples=OUT_SAMPLES,
             target_rms=TARGET_RMS,
             rms_sample_shots=RMS_SAMPLE_SHOTS,
             envelope_gain="none",
@@ -231,7 +332,8 @@ def main():
                       rms_input_shot_index=idx)
 
         if WRITE_ALL:
-            out_info, rms_out = write_all(data, out_rel, norm_scale)
+            out_info, rms_out = write_all(data, out_rel, norm_scale,
+                                          t_mute, dt_ms)
             info.update(rms_output_mean=float(rms_out.mean()),
                         rms_output_min=float(rms_out.min()),
                         rms_output_max=float(rms_out.max()), **out_info)

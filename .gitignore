@@ -37,3 +37,6 @@ hj_code/
 *.zip
 *.iml
 *~
+
+# Script-regenerated exports; see process/export_das_decimated.py.
+export/
