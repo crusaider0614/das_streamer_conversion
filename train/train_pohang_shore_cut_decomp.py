@@ -12,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from module.dataset_pohang_shore import PohangShoreDataset
+from module.ssim import SSIM
 from network.pohang_shore_network_aniso import get_gen_model, get_patch_net, get_dis_model, PatchNCELoss
 from utils.data import get_project_root, ValueTracker
 from utils.parallel import setup, cleanup, run_target
@@ -29,14 +30,6 @@ def main(config):
 
     world_size = torch.cuda.device_count() if CF.DEVICE == "cuda" else 1
     run_target(train, world_size, CF)
-
-
-def patch_nce(criterion, query_projected, key_projected, rank):
-    """PatchNCE averaged over the encoder layers the patch net sampled."""
-    loss = torch.zeros((), device=rank, dtype=torch.float32)
-    for feat_q, feat_k in zip(query_projected, key_projected):
-        loss = loss + criterion(feat_q, feat_k)
-    return loss / max(len(query_projected), 1)
 
 
 def train(rank, world_size, CF):
@@ -118,10 +111,10 @@ def train(rank, world_size, CF):
         PF = DDP(PF, device_ids=[rank], find_unused_parameters=True)
         D_B = DDP(D_B, device_ids=[rank], find_unused_parameters=True)
 
-    # Loss.  Standard CUT is adversarial + PatchNCE only; the L1 and the SSIM
-    # that used to be here belonged to the signal/noise decomposition and now
-    # live in train_pohang_shore_cut_decomp.py.
-    nce_criterion = PatchNCELoss().to(rank)
+    # Loss
+    value_criterion = nn.L1Loss().to(rank)
+    ssim_criterion = SSIM().to(rank)
+    nce_criterion = PatchNCELoss().cuda()
 
     # Optimizer
     optimizer_G = optim.AdamW(chain(G_A2B.parameters(), PF.parameters()), lr=CF.TRAIN.GEN_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2), weight_decay=1e-4)
@@ -130,7 +123,7 @@ def train(rank, world_size, CF):
     lr_scheduler_G   = optim.lr_scheduler.ExponentialLR(optimizer_G,   gamma=1.0)
     lr_scheduler_D_B = optim.lr_scheduler.ExponentialLR(optimizer_D_B, gamma=1.0)
 
-    idt_losses = []
+    identity_losses = []
     nce_losses = []
     G_losses = []
     D_B_losses = []
@@ -155,7 +148,7 @@ def train(rank, world_size, CF):
             lr_scheduler_G.load_state_dict(state["lr_scheduler_G"])
             lr_scheduler_D_B.load_state_dict(state["lr_scheduler_D_B"])
 
-        idt_losses = state.get("idt_loss", [])
+        identity_losses = state["identity_loss"]
         nce_losses = state["nce_loss"]
         G_losses = state["G_loss"]
         D_B_losses = state["D_B_loss"]
@@ -173,19 +166,20 @@ def train(rank, world_size, CF):
     scaler = GradScaler(device="cuda")
     noise_level = CF.DATASET.NOISE
     ema_coeff = 0.99
-    avg_idt_loss = ValueTracker(ema_coeff)
+    avg_identity_loss = ValueTracker(ema_coeff)
     avg_nce_loss = ValueTracker(ema_coeff)
     avg_G_loss = ValueTracker(ema_coeff)
     avg_D_B_loss = ValueTracker(ema_coeff)
     avg_G_B_loss = ValueTracker(ema_coeff)
     grad_ratio = CF.TRAIN.LAMBDA_ADV
+    same_B_target = None
     for i_epoch in range(CF.TRAIN.BEGIN_EPOCH, CF.TRAIN.END_EPOCH):
         if rank == 0:
             lr_G = lr_scheduler_G.get_last_lr()
             lr_D_B = lr_scheduler_D_B.get_last_lr()
             print(f"epoch: {i_epoch + 1:4d}, learning rate: {lr_G[0]} {lr_D_B[0]}")
         start_time = time.time()
-        avg_idt_loss.initialize()
+        avg_identity_loss.initialize()
         avg_nce_loss.initialize()
         avg_G_loss.initialize()
         avg_D_B_loss.initialize()
@@ -198,6 +192,9 @@ def train(rank, world_size, CF):
                 real_A_images = real_A_images.to(rank, non_blocking=True)
                 real_B_images = real_B_images.to(rank, non_blocking=True)
 
+                if same_B_target is None:
+                    same_B_target = torch.zeros_like(real_B_images)
+
                 # Generator
                 for param in G_A2B.parameters():
                     param.requires_grad_(True)
@@ -208,52 +205,39 @@ def train(rank, world_size, CF):
                     param.requires_grad_(False)
 
                 with autocast(device_type="cuda"):
-                    # A -> B, and the PatchNCE that ties the output to its own
-                    # input patch by patch
-                    fake_B_images, real_A_features = G_A2B(
-                        real_A_images, extract_features=True, is_check=True)
-                    fake_B_features = G_A2B(fake_B_images, encode_only=True,
-                                            extract_features=True,
-                                            is_check=True)
-                    real_A_projected, patch_ids = PF(real_A_features)
-                    fake_B_projected = PF(fake_B_features,
-                                          patch_ids=patch_ids)
-                    nce_loss = patch_nce(nce_criterion, fake_B_projected,
-                                         real_A_projected, rank)
+                    gen_output = G_A2B(real_B_images, is_check=True)
+                    same_B_images = gen_output[:, 0: 1, :, :]
+                    same_B_noise = gen_output[:, 1: 2, :, :]
 
-                    # B -> B.  CUT's identity term is the SAME PatchNCE run on
-                    # domain B, not an L1: the generator should leave a real B
-                    # alone, and measuring that the same way as the A -> B term
-                    # keeps one loss shape rather than mixing an L1 in.  This
-                    # is lambda_Y in the paper, LAMBDA_I here; set it to 0 for
-                    # the FastCUT variant, which drops this term and the extra
-                    # forward with it.
-                    idt_loss = torch.zeros((), device=rank,
-                                           dtype=torch.float32)
-                    if CF.TRAIN.LAMBDA_I > 0:
-                        same_B_images, real_B_features = G_A2B(
-                            real_B_images, extract_features=True,
-                            is_check=True)
-                        same_B_features = G_A2B(same_B_images,
-                                                encode_only=True,
-                                                extract_features=True,
-                                                is_check=True)
-                        real_B_projected, idt_ids = PF(real_B_features)
-                        same_B_projected = PF(same_B_features,
-                                              patch_ids=idt_ids)
-                        idt_loss = patch_nce(nce_criterion, same_B_projected,
-                                             real_B_projected, rank)
+                    gen_output, real_A_features = G_A2B(real_A_images, extract_features=True, is_check=True)
+                    fake_B_images = gen_output[:, 0: 1, :, :]
+                    fake_B_noise = gen_output[:, 1: 2, :, :]
+
+                    fake_B_features = G_A2B(fake_B_images, encode_only=True, extract_features=True, is_check=True)
+
+                    real_A_projected, patch_ids = PF(real_A_features)
+                    fake_B_projected = PF(fake_B_features, patch_ids=patch_ids)
+
+                    identity_loss = (
+                            value_criterion(real_B_images, same_B_images) +
+                            value_criterion(same_B_noise, same_B_target) +
+                            value_criterion(real_A_images, fake_B_images + fake_B_noise)
+                    )
+
+                    nce_loss = torch.zeros(1, device=rank, dtype=torch.float32)
+                    for feat_q, feat_k in zip(fake_B_projected, real_A_projected):
+                        nce_loss += nce_criterion(feat_q, feat_k)
+                    nce_loss = nce_loss / len(fake_B_projected)
 
                     fake_B_logits = D_B(fake_B_images)
                     GAN_loss = -fake_B_logits.mean()
 
-                    G_loss = (
-                        CF.TRAIN.LAMBDA_ADV * GAN_loss +
-                        CF.TRAIN.LAMBDA_N * nce_loss +
-                        CF.TRAIN.LAMBDA_I * idt_loss
-                    )
+                    G_loss =\
+                        CF.TRAIN.LAMBDA_ADV * GAN_loss +\
+                        CF.TRAIN.LAMBDA_N * nce_loss +\
+                        CF.TRAIN.LAMBDA_I * identity_loss
 
-                avg_idt_loss.feed(idt_loss.detach().item())
+                avg_identity_loss.feed(identity_loss.detach().item())
                 avg_nce_loss.feed(nce_loss.detach().item())
                 avg_G_B_loss.feed(fake_B_logits.detach().mean().item())
                 avg_G_loss.feed(G_loss.detach().item())
@@ -291,10 +275,10 @@ def train(rank, world_size, CF):
                 scaler.update()
 
                 if rank == 0 and ((i_batch + 1) % 10 == 0 or (i_batch + 1) == n_batch):
-                    print("epoch: {:4}, batch: {:4}, idt_nce: {:8.2e}, nce_loss: {:8.2e}, G_loss: {:9.2e}, B_score: {:7.4f}, {:7.4f}".format(
+                    print("epoch: {:4}, batch: {:4}, identity_loss: {:8.2e}, nce_loss: {:8.2e}, G_loss: {:9.2e}, B_score: {:7.4f}, {:7.4f}".format(
                         i_epoch + 1,
                         i_batch + 1,
-                        avg_idt_loss.val(),
+                        avg_identity_loss.val(),
                         avg_nce_loss.val(),
                         avg_G_loss.val(),
                         avg_D_B_loss.val(),
@@ -307,7 +291,7 @@ def train(rank, world_size, CF):
 
         if rank == 0:
             if True:
-                idt_losses.append(avg_idt_loss.val())
+                identity_losses.append(avg_identity_loss.val())
                 nce_losses.append(avg_nce_loss.val())
                 G_losses.append(avg_G_loss.val())
                 D_B_losses.append(avg_D_B_loss.val())
@@ -321,7 +305,7 @@ def train(rank, world_size, CF):
                     "optimizer_D_B": optimizer_D_B.state_dict(),
                     "lr_scheduler_G": lr_scheduler_G.state_dict(),
                     "lr_scheduler_D_B": lr_scheduler_D_B.state_dict(),
-                    "idt_loss": idt_losses,
+                    "identity_loss": identity_losses,
                     "nce_loss": nce_losses,
                     "G_loss": G_losses,
                     "D_B_loss": D_B_losses,
@@ -341,4 +325,4 @@ def train(rank, world_size, CF):
     cleanup()
 
 if __name__ == "__main__":
-    main("pohang_shore_das_str_cut.yaml")
+    main("pohang_shore_das_str_cut_decomp.yaml")
