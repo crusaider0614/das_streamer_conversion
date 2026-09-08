@@ -177,7 +177,7 @@ class PohangShoreDataset(Dataset):
 
 
 if __name__ == "__main__":
-    crop_size = (512, 72)
+    crop_size = (256, 256)
     A_dataset = PohangShoreDataset(
         is_das=True, crop_size=crop_size, total_length=20,
         is_flip=False, is_negative=False, noise=0.0, is_train=True)

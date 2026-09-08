@@ -5,7 +5,7 @@ TAG: "pohang_shore_das_str_cut"
 CUDNN_BENCHMARK: True
 SEED: 19467
 DEVICE: "cuda"
-GPUS: [ 0 ]
+GPUS: [ 0, 1 ]
 
 PRETRAIN:
   LOAD: False
@@ -14,7 +14,7 @@ PRETRAIN:
   LOAD_OPTIMIZER: True
 
 DATASET:
-  CROP_SIZE: [ 512, 72 ]
+  CROP_SIZE: [ 256, 256 ]
   NUM_DATA: 2800
   NOISE: 0.05
   NOISE_DECAY: 0.98
@@ -33,7 +33,7 @@ MODEL:
   DIS_CBAM: True
 
 TRAIN:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 8
   ITER_PER_EPOCH: 1
   BEGIN_EPOCH: 0
   END_EPOCH: 200
