@@ -5,19 +5,19 @@ TAG: "pohang_shore_das_str_cut"
 CUDNN_BENCHMARK: True
 SEED: 19467
 DEVICE: "cuda"
-GPUS: [ 0, 1 ]
+GPUS: [ 4, 5, 6, 7 ]
 
 PRETRAIN:
   LOAD: False
   TAG: "pohang_shore_das_str_cut"
-  LOAD_EPOCH: 0
+  LOAD_EPOCH: 120
   LOAD_OPTIMIZER: True
 
 DATASET:
-  CROP_SIZE: [ 256, 256 ]
-  NUM_DATA: 2800
-  NOISE: 0.05
-  NOISE_DECAY: 0.98
+  CROP_SIZE: [ 512, 128 ]
+  NUM_DATA: 10000
+  NOISE: 0.01
+  NOISE_DECAY: 0.995
 
 MODEL:
   A_CHANNELS: 1        # DAS
@@ -33,16 +33,16 @@ MODEL:
   DIS_CBAM: True
 
 TRAIN:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 20
   ITER_PER_EPOCH: 1
   BEGIN_EPOCH: 0
   END_EPOCH: 200
   CHECK_EPOCH: 10
   GEN_LR: 0.0001
-  DIS_LR: 0.0002
+  DIS_LR: 0.00005
   BETA1: 0.5
-  BETA2: 0.99
-  LAMBDA_I: 1.0        # identity loss
+  BETA2: 0.999
+  LAMBDA_I: 0.5        # identity loss
   LAMBDA_ADV: 1.0      # adversarial loss
-  LAMBDA_N: 1.0        # PatchNCE loss
+  LAMBDA_N: 0.5        # PatchNCE loss
   LAMBDA_SSIM: 1.0

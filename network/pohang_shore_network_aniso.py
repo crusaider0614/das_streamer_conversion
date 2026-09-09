@@ -41,6 +41,15 @@ class SpectralConv2d(nn.Module):
         return self.conv(x)
 
 
+class SpectralLinear(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(SpectralLinear, self).__init__()
+        self.linear = spectral_norm(nn.Linear(*args, **kwargs))
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class AdaptiveInstanceNorm(nn.Module):
     def __init__(self, in_channels, info_channels, channels, kernel_size, is_spec=False):
         super(AdaptiveInstanceNorm, self).__init__()
@@ -133,15 +142,16 @@ class CBAM(nn.Module):
         super(CBAM, self).__init__()
 
         conv = SpectralConv2d if is_spec else nn.Conv2d
+        linear = SpectralLinear if is_spec else nn.Linear
 
         self.global_avgpool = nn.AdaptiveAvgPool2d(1)
         self.global_maxpool = nn.AdaptiveMaxPool2d(1)
 
         channels = in_channels // reduction
         self.mlp = nn.Sequential(
-            nn.Linear(in_channels, channels),
+            linear(in_channels, channels),
             nn.SiLU(),
-            nn.Linear(channels, in_channels),
+            linear(channels, in_channels),
         )
 
         self.conv = nn.Sequential(
@@ -293,14 +303,14 @@ class ResBlock(nn.Module):
             self.pool = nn.Identity()
 
         self.bypass = nn.Sequential(
-            conv(in_channels, out_channels, 1, stride=1, padding=0, groups=2) if (in_channels != out_channels) else nn.Identity()
+            conv(in_channels, out_channels, 1, stride=1, padding=0) if (in_channels != out_channels) else nn.Identity()
         )
 
         self.residual = nn.Sequential(
-            conv(in_channels, out_channels, 3, stride=1, padding=1, groups=2),
+            conv(in_channels, out_channels, 3, stride=1, padding=1),
             nn.InstanceNorm2d(out_channels, affine=True) if is_norm else nn.Identity(),
             nn.SiLU(),
-            conv(out_channels, out_channels, 3, stride=1, padding=1, groups=2),
+            conv(out_channels, out_channels, 3, stride=1, padding=1),
         )
 
         self.last = nn.Sequential(
@@ -327,7 +337,7 @@ class UNetGenerator(nn.Module):
         self.conv = nn.Sequential(
             conv(in_channels, channels, 3, stride=1, padding=1),
             nn.SiLU(),
-            conv(channels, channels, 3, stride=1, padding=1, groups=2),
+            conv(channels, channels, 3, stride=1, padding=1),
             nn.InstanceNorm2d(channels, affine=True) if is_norm else nn.Identity(),
             nn.SiLU(),
         )
@@ -358,9 +368,10 @@ class UNetGenerator(nn.Module):
         self.decode2 = DecodeBlock(1 * channels, 1 * channels, 1 * channels, is_norm=is_norm, is_spec=is_spec, is_cbam=is_cbam, cbam_kernel=5)
 
         self.logit = nn.Sequential(
-            # conv(4 * channels, 4 * channels, 1, stride=1, padding=0),
-            # nn.SiLU(),
-            conv(8 * channels, out_channels, 1, stride=1, padding=0),
+            conv(8 * channels, 2 * channels, 3, stride=1, padding=1),
+            nn.SiLU(),
+            conv(2 * channels, out_channels, 1, stride=1, padding=0),
+            nn.Tanh(),
         )
 
     def disable_grad(self):
@@ -452,10 +463,10 @@ class PatchSampleF(nn.Module):
         self.num_patches = num_patches
 
         self.channels_list = [
-            1 * base_channels // 2,
-            2 * base_channels // 2,
-            4 * base_channels // 2,
-            8 * base_channels // 2,
+            1 * base_channels,
+            2 * base_channels,
+            4 * base_channels,
+            8 * base_channels,
         ]
 
         self.mlps = nn.ModuleList()
@@ -474,7 +485,7 @@ class PatchSampleF(nn.Module):
         for i, (feat, mlp) in enumerate(zip(features, self.mlps)):
             B, C, H, W = feat.shape
 
-            feat_reshape = feat[:, :C // 2, :, :].view(B, C // 2, -1).permute(0, 2, 1)
+            feat_reshape = feat.view(B, C, -1).permute(0, 2, 1)
 
             if patch_ids is not None:
                 patch_id = patch_ids[i]
@@ -613,7 +624,7 @@ def get_gen_model(cfg, from_a, additional_channel=0, **kwargs):
         model = UNetGenerator(
             cfg.MODEL.A_CHANNELS + additional_channel,
             cfg.MODEL.GEN_CHANNELS,
-            cfg.MODEL.OUT_CHANNELS,
+            cfg.MODEL.B_CHANNELS,
             is_norm=cfg.MODEL.GEN_NORM,
             is_spec=cfg.MODEL.GEN_SPEC,
             is_cbam=cfg.MODEL.GEN_CBAM,
@@ -622,7 +633,7 @@ def get_gen_model(cfg, from_a, additional_channel=0, **kwargs):
         model = UNetGenerator(
             cfg.MODEL.B_CHANNELS + additional_channel,
             cfg.MODEL.GEN_CHANNELS,
-            cfg.MODEL.OUT_CHANNELS,
+            cfg.MODEL.A_CHANNELS,
             is_norm=cfg.MODEL.GEN_NORM,
             is_spec=cfg.MODEL.GEN_SPEC,
             is_cbam=cfg.MODEL.GEN_CBAM
@@ -689,7 +700,7 @@ if __name__ == "__main__":
     gen.apply(init_weights)
     dis.apply(init_weights)
 
-    x = torch.randn(batch_size, 1, 4000, 72)
+    x = torch.randn(batch_size, 1, 512, 256)
     y, features = gen(x, extract_features=True, is_check=False)
     y = y[:, 0: 1] + y[:, 1: 2]
     r = dis(y, is_check=False)

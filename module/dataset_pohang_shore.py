@@ -75,7 +75,7 @@ class PohangShoreDataset(Dataset):
             is_negative=False,
             noise=0.0,
             is_train=True,
-            clip=99,
+            clip=99.9,
             stage="rg_train",
     ):
         self.is_das = is_das
@@ -110,7 +110,7 @@ class PohangShoreDataset(Dataset):
         sample = np.asarray(self.data[idx], dtype=np.float32)
         self.lower_clip = float(np.percentile(sample, (100 - clip) / 2))
         self.upper_clip = float(np.percentile(sample, 100 - (100 - clip) / 2))
-        self.value_range = max(self.upper_clip, -self.lower_clip) / 2.0
+        self.value_range = max(self.upper_clip, -self.lower_clip)
         if self.value_range <= 0:
             raise SystemExit(f"{name}: clip range is degenerate "
                              f"[{self.lower_clip}, {self.upper_clip}]")
@@ -139,13 +139,17 @@ class PohangShoreDataset(Dataset):
         likely as the interior ones.
         """
         nt, nx = self.crop_size
+        mt = (nt - 1) // 4
+        mx = (nx - 1) // 4
         best, best_live = None, -1.0
         for _ in range(MAX_TRIES if self.is_train else 1):
-            mt = self.n_samp // 500
             st = random.randint(-mt, self.n_samp - nt + mt)
+            sx = random.randint(-mx, self.n_shot - nx + mx)
+
             st = int(np.clip(st, 0, self.n_samp - nt))
-            sx = random.randint(0, self.n_shot - nx)
-            patch = gather[st:st + nt, sx:sx + nx]
+            sx = int(np.clip(sx, 0, self.n_shot - nx))
+
+            patch = gather[st: st + nt, sx: sx + nx]
             live = self.live_fraction(patch)
             if live > best_live:
                 best, best_live = patch, live
@@ -177,7 +181,7 @@ class PohangShoreDataset(Dataset):
 
 
 if __name__ == "__main__":
-    crop_size = (256, 256)
+    crop_size = None
     A_dataset = PohangShoreDataset(
         is_das=True, crop_size=crop_size, total_length=20,
         is_flip=False, is_negative=False, noise=0.0, is_train=True)

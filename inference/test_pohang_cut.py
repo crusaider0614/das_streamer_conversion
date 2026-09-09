@@ -21,7 +21,7 @@ def show_in_plot(imgs, perc=0.95):
     plt.show()
 
 
-epoch = 50
+epoch = 130
 
 # Define
 config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut.yaml")
@@ -33,8 +33,8 @@ tag = CF.TAG
 print("Tag:", tag)
 
 # Dataset
-num_data = 20
-# num_data = 281
+# num_data = 20
+num_data = 240
 A_dataset = PohangShoreDataset(
     is_das=True,
     crop_size=None,
@@ -43,6 +43,7 @@ A_dataset = PohangShoreDataset(
     is_negative=False,
     noise=0.0,
     is_train=False,
+    stage="rg_infer"
 )
 B_dataset = PohangShoreDataset(
     is_das=False,
@@ -90,7 +91,7 @@ with torch.no_grad():
             fake_B_numpy, tb,
             real_B_numpy, tb,
             same_B_numpy,
-        ), axis=1)[:1000]
+        ), axis=1)
 
         print(real_A_image.min(), real_A_image.max())
         print(fake_B_image.min(), fake_B_image.max())

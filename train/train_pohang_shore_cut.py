@@ -84,13 +84,13 @@ def train(rank, world_size, CF):
     )
 
     A_sampler = DistributedSampler(A_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
-    B_sampler = DistributedSampler(B_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    B_sampler = DistributedSampler(B_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True, seed=71138602)
 
     A_loader = DataLoader(
         A_dataset,
         shuffle=False,
         batch_size=CF.TRAIN.BATCH_SIZE // world_size,
-        num_workers=1,
+        num_workers=2,
         pin_memory=True,
         sampler=A_sampler,
         persistent_workers=True,
@@ -99,7 +99,7 @@ def train(rank, world_size, CF):
         B_dataset,
         shuffle=False,
         batch_size=CF.TRAIN.BATCH_SIZE // world_size,
-        num_workers=1,
+        num_workers=2,
         pin_memory=True,
         sampler=B_sampler,
         persistent_workers=True,
@@ -171,7 +171,7 @@ def train(rank, world_size, CF):
     # lr_scheduler_D_B = torch.optim.lr_scheduler.ExponentialLR(optimizer_D_B, gamma=1.0)
 
     scaler = GradScaler(device="cuda")
-    noise_level = CF.DATASET.NOISE
+    noise_level = CF.DATASET.NOISE * (CF.DATASET.NOISE_DECAY ** CF.TRAIN.BEGIN_EPOCH)
     ema_coeff = 0.99
     avg_idt_loss = ValueTracker(ema_coeff)
     avg_nce_loss = ValueTracker(ema_coeff)
