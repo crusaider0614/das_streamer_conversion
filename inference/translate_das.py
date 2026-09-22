@@ -114,7 +114,14 @@ MUTE_PAD_MS = 20.0
 # Windows per forward pass.  Each is 2000 x 128 floats.
 BATCH = 4
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Which GPU.  "cuda" on its own means cuda:0, which on a shared box is
+# whichever card came first and probably not the one this job was given - the
+# training config names GPUS [4, 5, 6, 7] and the older test script hard-codes
+# cuda:9.  So the index is written out.  None runs on the CPU, which works
+# but is slow: the FID's Inception dominates everything there.
+GPU = 0
+DEVICE = (f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available()
+          else "cpu")
 
 # Print a line every this many receivers.
 REPORT_EVERY = 10

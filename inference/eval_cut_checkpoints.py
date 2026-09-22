@@ -75,6 +75,13 @@ The table opens with two rows that are not checkpoints:
 
 Every G(A) row is read between those two.
 
+Metric 0 uses its own sample count in each bin, and reports nan for a bin
+that cannot reach FID_MIN_SAMPLES.  Both Frechet distances grow as the sample
+count falls, so a count shared across the bins ties the far bin - tens of
+thousands of tiles - to whatever the near one holds.  Reading down a column is
+the only comparison metric 0 supports; the near and far numbers are not
+comparable with each other and are not meant to be.
+
 Metric 4, shot-axis semblance, was dropped: both domains sit at the incoherent
 floor (das 0.1087, str 0.1018, floor 1/9 = 0.1111) because the sorted shot axis
 interleaves four passes at an uneven 3.33 m median spacing.  It cannot measure
@@ -84,13 +91,16 @@ The two offset bins
 -------------------
 Every metric above is offset dependent - instantaneous frequency alone runs
 83.8 -> 138.4 Hz across the offset range - so each is reported twice, split at
-OFFSET_SPLIT_M.  The split is not a round number: 184.1 m is the smallest
-source-receiver distance anywhere in the streamer data, and it is smallest
-because the streamer sits at 1240-1312 m along the line while the shots run
--1059..+1056 m.  The array is off the end of the sail line, so no shot ever
-passes over it.
+OFFSET_SPLIT_M.  The split is not a round number and is not written down:
+it is read from the geometry as the smallest source-receiver distance
+anywhere in the streamer data, 184.0648 m.  It is smallest because the
+streamer sits at 1240-1312 m along the line while the shots run -1059..+1056
+m - the array is off the end of the sail line, so no shot ever passes over
+it.  Rounding it to 184.1 leaves that one trace on the near side of its own
+boundary, which was enough to put a window, and 12 tiles, into a bin that has
+to be empty.
 
-    near   < 184.1 m     DAS only.  There is no streamer trace at this offset
+    near   < 184.06 m    DAS only.  There is no streamer trace at this offset
                          anywhere in the survey, so the near bin has no
                          reference of its own: metric 0 compares it against
                          the streamer's far patches and metric 1 does not
@@ -98,7 +108,7 @@ passes over it.
                          model was never shown what a streamer looks like
                          here - not as a score.  With 87 m of water this is
                          also the only bin that contains the moveout apex.
-    far   >= 184.1 m     The band both instruments cover, filled continuously
+    far   >= 184.06 m    The band both instruments cover, filled continuously
                          (largest gap between consecutive traces 3.18 m) up to
                          2371 m.
 
@@ -192,10 +202,20 @@ EVAL_RECEIVERS = None
 # Shot windows per receiver, evenly spaced across the 551 sorted shots.
 N_WINDOWS = 4
 
-# The offset the bins split at, in metres.  184.1 is the streamer's own
-# minimum offset - see the header.
-OFFSET_SPLIT_M = 184.1
+# The offset the bins split at, in metres.  None takes the streamer's own
+# minimum offset from the geometry, which is the definition the split is
+# meant to have - see the header.  Do not hard-code a rounded copy of it: the
+# sidecar holds float32, its minimum is 184.0648, and 184.1 puts that one
+# trace on the near side of a boundary it defines.  That single trace drags a
+# whole window, and 12 tiles, into a bin that should be empty.
+OFFSET_SPLIT_M = None
 BINS = ("near", "far")
+
+# A bin with fewer tiles than this gets nan for metric 0 rather than a number.
+# Both Frechet distances grow as the sample count falls - measured, FD is
+# 25.1 at n=209 and 35.0 at n=100 on the same data - so a handful of patches
+# produces a large, confident and meaningless value.
+FID_MIN_SAMPLES = 64
 
 # Metric 5: the sub-window the local lag is measured on, and how far the
 # search looks.  +-16 ms and +-4 shots is generous for a displacement that
@@ -241,7 +261,14 @@ FID_SEED = 71138602
 # Write metrics_<TAG>.csv next to the checkpoints.  A falsy value skips it.
 CSV_DIR = "checkpoint"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Which GPU.  "cuda" on its own means cuda:0, which on a shared box is
+# whichever card came first and probably not the one this job was given - the
+# training config names GPUS [4, 5, 6, 7] and the older test script hard-codes
+# cuda:9.  So the index is written out.  None runs on the CPU, which works
+# but is slow: the FID's Inception dominates everything there.
+GPU = 0
+DEVICE = (f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available()
+          else "cpu")
 
 # ---------------------------------------------------------------------------
 
@@ -798,6 +825,12 @@ def main():
         raise SystemExit(f"no checkpoints named {TAG}_<epoch> under "
                          f"{resolve('checkpoint')}")
 
+    global OFFSET_SPLIT_M
+    if OFFSET_SPLIT_M is None:
+        OFFSET_SPLIT_M = float(offsets("str").min())
+        print(f"  offset split taken from the streamer's own minimum: "
+              f"{OFFSET_SPLIT_M:.4f} m")
+
     A_ds = Gathers(STAGE)
     B_ds = (PohangShoreDataset(is_das=False, crop_size=None, total_length=1,
                                stage="rg_train") if A_ds.b_row else None)
@@ -846,22 +879,34 @@ def main():
                           fd=np.nan, fid=np.nan)
                   for b, n in enumerate(BINS)}
 
-    inception, B_stats, B_fd, fid_n = None, {}, {}, 0
+    inception, B_stats, B_fd = None, {}, {}
+    fid_n = [0, 0]
     use_fd, use_fid = USE_FD, USE_FID
     for name in BINS:
         A_rows[name]["fd"] = np.nan
         A_rows[name]["fid"] = np.nan
     if use_fd or use_fid:
-        counts = [len(A_tiles[b]) for b in (0, 1)]
-        sizes = [c for c in counts + [len(t) for t in B_tiles] if c]
-        fid_n = min(sizes) if sizes else 0
-        if FID_MAX_SAMPLES is not None:
-            fid_n = min(fid_n, FID_MAX_SAMPLES)
-        print(f"  metric 0 on {FID_PATCH[0]}x{FID_PATCH[1]} tiles, {fid_n} "
-              f"per set   das near {counts[0]} / far {counts[1]}, "
+        # One sample count PER BIN.  Forcing both bins to the same n ties the
+        # far bin - tens of thousands of tiles - to whatever the near bin
+        # happens to hold, and metric 0 is only ever compared down a column,
+        # never across the two.  The near bin is small by nature and on the
+        # streamer side it is empty; one count for everything made a run come
+        # out at n=12, where the floor (14.48) exceeded the distance it was
+        # supposed to be the floor of (8.52).
+        print(f"  metric 0 on {FID_PATCH[0]}x{FID_PATCH[1]} tiles: "
+              f"das near {len(A_tiles[0])} / far {len(A_tiles[1])}, "
               f"str near {len(B_tiles[0])} / far {len(B_tiles[1])}")
-        if fid_n < 8:
-            print("  too few live tiles; skipping metric 0")
+        for b, name in enumerate(BINS):
+            sizes = [len(t[b]) for t in (A_tiles, B_tiles) if t[b]]
+            n = min(sizes) if sizes else 0
+            if FID_MAX_SAMPLES is not None:
+                n = min(n, FID_MAX_SAMPLES)
+            fid_n[b] = n if n >= FID_MIN_SAMPLES else 0
+            print(f"    {name:>4}  n {n}"
+                  + ("" if fid_n[b] else
+                     f"  < FID_MIN_SAMPLES {FID_MIN_SAMPLES}, metric 0 is "
+                     f"nan for this bin"))
+        if not any(fid_n):
             use_fd = use_fid = False
 
     # The reference is the streamer patches for that bin, and the near bin
@@ -873,27 +918,33 @@ def main():
     ref = B_tiles if B_ds is not None else A_tiles
     if use_fd:
         for b, name in enumerate(BINS):
-            B_fd[name] = fd_stats(ref[b] if ref[b] else ref[1], fid_n)
+            if not fid_n[b]:
+                continue
+            src = ref[b] if len(ref[b]) >= fid_n[b] else ref[1]
+            B_fd[name] = fd_stats(src, fid_n[b])
             A_rows[name]["fd"] = (
-                calculate_frechet_distance(*fd_stats(A_tiles[b], fid_n),
+                calculate_frechet_distance(*fd_stats(A_tiles[b], fid_n[b]),
                                            *B_fd[name])
                 if A_tiles[b] else np.nan)
-            if S_rows is not None and len(ref[b]) >= 16:
+            if S_rows is not None and len(src) >= 2 * FID_MIN_SAMPLES:
                 # the str row carries the floor: the same distribution
                 # against itself, which is what a perfect G(A) would score
-                S_rows[name]["fd"], zn = fd_floor(ref[b], fid_n)
+                S_rows[name]["fd"], zn = fd_floor(src, fid_n[b])
                 S_rows[name]["floor_n"] = zn
     if use_fid:
         inception = InceptionNetwork().eval().to(DEVICE)
         for b, name in enumerate(BINS):
-            B_stats[name] = fid_stats(ref[b] if ref[b] else ref[1],
-                                      fid_n, inception)
+            if not fid_n[b]:
+                continue
+            src = ref[b] if len(ref[b]) >= fid_n[b] else ref[1]
+            B_stats[name] = fid_stats(src, fid_n[b], inception)
             A_rows[name]["fid"] = (
                 calculate_frechet_distance(
-                    *fid_stats(A_tiles[b], fid_n, inception), *B_stats[name])
+                    *fid_stats(A_tiles[b], fid_n[b], inception),
+                    *B_stats[name])
                 if A_tiles[b] else np.nan)
-            if S_rows is not None and len(ref[b]) >= 16:
-                S_rows[name]["fid"], zn = fid_floor(ref[b], fid_n, inception)
+            if S_rows is not None and len(src) >= 2 * FID_MIN_SAMPLES:
+                S_rows[name]["fid"], zn = fid_floor(src, fid_n[b], inception)
                 S_rows[name]["floor_n"] = zn
     del A_tiles, B_tiles, ref
 
@@ -936,19 +987,19 @@ def main():
         g, ch = build_generator(state["G_A2B"])
         fake_tiles, m = score(translator(g), A_ds, B_ds, off_a, recv, starts)
         for b, name in enumerate(BINS):
-            ok = len(fake_tiles[b]) >= 8
+            ok = fid_n[b] and len(fake_tiles[b]) >= fid_n[b]
             m[name]["fd"] = (
-                calculate_frechet_distance(*fd_stats(fake_tiles[b], fid_n),
+                calculate_frechet_distance(*fd_stats(fake_tiles[b], fid_n[b]),
                                            *B_fd[name])
-                if use_fd and ok else np.nan)
+                if use_fd and ok and name in B_fd else np.nan)
             m[name]["fid"] = (
                 calculate_frechet_distance(
-                    *fid_stats(fake_tiles[b], fid_n, inception),
+                    *fid_stats(fake_tiles[b], fid_n[b], inception),
                     *B_stats[name])
-                if use_fid and ok else np.nan)
+                if use_fid and ok and name in B_stats else np.nan)
         emit(str(ep), m)
         del g, state, fake_tiles
-        if DEVICE == "cuda":
+        if DEVICE != "cpu":
             torch.cuda.empty_cache()
 
     if CSV_DIR:
