@@ -27,23 +27,11 @@ distributions and positions instead.
          - 35.0 at n=100, 25.7 at n=200, 25.1 at n=209 - so the equal-n rule
          below covers both.
      0b  FID, the usual InceptionV3 one, which is what the wider GAN
-         literature reports.
-             das vs str  53.4 far, 109.6 near, floor 6.83
-         on the full 264 receivers against the dense reference, 1690 tiles
-         per half in the floor.  The caveats are in module/fid.py: Inception
+         literature reports.  The caveats are in module/fid.py: Inception
          has never seen seismic and the 2048 x 2048 covariance is estimated
-         from a couple of thousand patches, so the value is biased and only
+         from a few thousand patches, so the value is biased and only
          comparable against the A and str rows of the same run, never
-         against a published image FID.  What is left of the bias now comes
-         from the A / G(A) side at FID_MAX_SAMPLES = 1024, n/d = 0.5;
-         raising it lowers the floor further at a linear cost in Inception
-         passes.
-
-         The first run downloads the weights (inception_v3_google-0cc3c7bd,
-         104 MB) into ~/.cache/torch/hub/checkpoints.  An offline machine
-         needs that file copied across.  On this GPU the floor took 15 s for
-         2 x 1690 tiles, so a checkpoint's two bins cost about 20 s against
-         58 s for the other metrics and 69 s for the generator itself.
+         against a published image FID.
 
   1  envelope correlation, corr(env(G(A)), env(B)) on the matched receiver
      Phase-insensitive, so the waveform change the translation is supposed to
