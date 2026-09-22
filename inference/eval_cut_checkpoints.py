@@ -170,6 +170,7 @@ import torch
 
 import config as C
 import process.shot_geometry as G
+from inference.translate_das import MUTE_PAD_MS, remute
 from module.dataset_pohang_shore import PohangShoreDataset
 from module.fid import (InceptionNetwork, calculate_activation_statistics,
                         calculate_frechet_distance)
@@ -229,6 +230,16 @@ IF_QUANTILE = 0.75
 IF_RANGE = (5.0, 450.0)
 
 DT_S = 1.0e-3
+
+# Put the mute back on G(A) before scoring it, exactly as
+# inference/translate_das.py does when it writes the file - same function,
+# same pad, imported rather than copied so the two cannot drift apart.  The
+# generator ends in tanh and fills the muted window with low-level texture;
+# the streamer it is scored against has hard zeros there, and leaving the
+# difference in would show up in every metric as something the model got
+# wrong when it is really something the file format decides.  On the A and
+# str rows it is a no-op - their muted samples are already zero.
+REMUTE = True
 
 # Metric 0.  The CROP windows are cut into tiles of this size, because
 # Inception takes a roughly square image and a 2000 x 128 gather resized to
@@ -563,7 +574,7 @@ def lag_over(fake, real, off):
 # --------------------------------------------------------------- metric 0 --
 
 
-def tiles(gather, off, live_from=None):
+def tiles(gather, off, live_from=None, parity=None):
     """Non-overlapping FID_PATCH tiles of one window, mute ones dropped.
 
     `live_from` is the gather liveness is judged on, when that is not the
@@ -573,17 +584,23 @@ def tiles(gather, off, live_from=None):
     Passing the input A keeps the selection geometric.
 
     Binned like the lag sub-windows, by the tile's smallest offset.
+
+    `parity` collects each tile's square on the checkerboard, (row + column)
+    mod 2 of its place in the window's own grid.  Only the floor uses it -
+    see `checker_halves`.
     """
     nt, nx = FID_PATCH
     mask = gather if live_from is None else live_from
     out = [[], []]
-    for t0 in range(0, gather.shape[0] - nt + 1, nt):
-        for x0 in range(0, gather.shape[1] - nx + 1, nx):
+    for it, t0 in enumerate(range(0, gather.shape[0] - nt + 1, nt)):
+        for ix, x0 in enumerate(range(0, gather.shape[1] - nx + 1, nx)):
             m = mask[t0:t0 + nt, x0:x0 + nx]
             if np.count_nonzero(m) >= FID_MIN_LIVE * m.size:
                 b = int(which_bin(off[x0:x0 + nx].min()))
                 out[b].append(np.asarray(gather[t0:t0 + nt, x0:x0 + nx],
                                          dtype=np.float32))
+                if parity is not None:
+                    parity[b].append((it + ix) % 2)
     return out
 
 
@@ -630,30 +647,65 @@ def fd_stats(patches, n):
     return f.mean(axis=0), np.cov(f, rowvar=False)
 
 
-def halves(patches, n):
-    """Up to 2n patches, shuffled, for a floor to be measured on.
+def checker_halves(patches, parity, n):
+    """Two halves of one set, laid out as a checkerboard.
 
-    The shuffle is the point.  The tiles arrive ordered by receiver and then
-    by shot window, so splitting them as they come measures the difference
-    between one end of the array and the other - a real quantity, but not
-    the sampling floor, and on the streamer it came out 17.5 against a
-    das-vs-str distance of 25.1.  Permuted first, the two halves differ by
-    sampling alone, which is what the floor is supposed to be.
+    The floor asks what a perfect G(A) would score, so it needs two samples
+    of ONE distribution that differ by nothing but sampling.  How they are
+    split decides what else creeps in, and the three obvious ways all put
+    something different in:
+
+      in order        the tiles arrive by receiver, so this measures one end
+                      of the array against the other.  Measured 17.5 on the
+                      streamer against a das-vs-str distance of 25.1 - not a
+                      floor at all.
+      shuffled        no systematic difference, but any two tiles that
+                      overlap can land on opposite sides, which fakes a low
+                      floor as soon as the tiling is denser than the patch.
+      by receiver     no overlap either way, but twelve receivers against
+                      twelve carries a real difference between them: 0.43 on
+                      the FD where the shuffled split gives 0.11, and it does
+                      not fall as more patches are added.
+
+    The checkerboard avoids all three.  Squares alternate across the window's
+    own grid, (row + column) mod 2, so both halves span the same receivers,
+    the same times and the same offsets - nothing systematic - while touching
+    tiles always land on opposite sides rather than overlapping ones.
+
+    What it does leave in is the local correlation between neighbouring
+    tiles, which makes the halves slightly more alike than two independent
+    draws, so this floor is a mild under-estimate rather than the over-
+    estimate the other splits give.  Used only for the streamer, which is the
+    only set a floor is measured on.
+
+    It needs both axes to have more than one square.  The window is 128 shots
+    and so is the patch, so as things stand the grid is 15 x 1 and the
+    "checkerboard" is alternating slabs of TIME - even tiles at 0-128,
+    256-384, ... against odd ones at 128-256, 384-512, ... Seismic character
+    depends strongly on absolute time, so that is a systematic difference and
+    the floor picks it up: measured 0.87 on the FD where the shuffled split
+    gives 0.11.  Two or more columns - which tiling the shot axis more
+    densely than the patch would give - put every time row in both halves and
+    the imbalance cancels.  main() says so when the grid is one column wide.
     """
     p = np.asarray(patches, dtype=np.float32)
-    rng = np.random.default_rng(FID_SEED)
-    p = p[rng.permutation(len(p))]
-    return p if n is None else p[:2 * n]
+    q = np.asarray(parity, dtype=int)
+    if len(q) != len(p):
+        raise SystemExit(f"{len(p)} patches but {len(q)} parity labels")
+    a, b = p[q == 0], p[q == 1]
+    m = min(len(a), len(b))
+    if n is not None:
+        m = min(m, n)
+    return a[:m], b[:m]
 
 
-def fd_floor(patches, n):
-    """As fid_floor, for metric 0a.  See the note there about n."""
-    p = halves(patches, n)
-    h = len(p) // 2
-    if h < 8:
-        return np.nan, h
-    return calculate_frechet_distance(*fd_stats(p[:h], None),
-                                      *fd_stats(p[h:2 * h], None)), h
+def fd_floor(patches, parity, n):
+    """As fid_floor, for metric 0a."""
+    a, b = checker_halves(patches, parity, n)
+    if len(a) < 8:
+        return np.nan, len(a)
+    return calculate_frechet_distance(*fd_stats(a, None),
+                                      *fd_stats(b, None)), len(a)
 
 
 def fid_stats(patches, n, network):
@@ -661,7 +713,7 @@ def fid_stats(patches, n, network):
         subsample(patches, n)[:, None], FID_BATCH, DEVICE, network)
 
 
-def fid_floor(patches, n, network):
+def fid_floor(patches, parity, n, network):
     """str against str, split in half: what a perfect translation would score.
 
     It is not zero.  Two halves of the same distribution differ by sampling
@@ -669,21 +721,21 @@ def fid_floor(patches, n, network):
     difference is large - which is exactly why the raw FID cannot be read
     without it.
 
-    Returns (value, n_per_half).  Two disjoint halves of n each need 2n
-    tiles and there are usually not that many, so n_per_half is normally
-    below the n the other FIDs use.  Fewer samples means a larger distance,
-    so the floor printed is an upper bound on the floor at the full n - if
-    a checkpoint's FID sits near it, it is comfortably at the floor.
+    Returns (value, n_per_half).  The checkerboard gives each half about
+    half the tiles, so n_per_half is below the n the other distances use,
+    and a smaller sample means a larger distance - the floor printed is
+    therefore high on that count, and low on the correlation between
+    neighbouring squares.  The two pull opposite ways; read it as an
+    indication rather than a bound, and read n_per_half with it.
     """
-    p = halves(patches, n)
-    h = len(p) // 2
-    if h < 8:
-        return np.nan, h
-    mu1, s1 = calculate_activation_statistics(p[:h, None], FID_BATCH,
+    a, b = checker_halves(patches, parity, n)
+    if len(a) < 8:
+        return np.nan, len(a)
+    mu1, s1 = calculate_activation_statistics(a[:, None], FID_BATCH,
                                               DEVICE, network)
-    mu2, s2 = calculate_activation_statistics(p[h:2 * h, None], FID_BATCH,
+    mu2, s2 = calculate_activation_statistics(b[:, None], FID_BATCH,
                                               DEVICE, network)
-    return calculate_frechet_distance(mu1, s1, mu2, s2), h
+    return calculate_frechet_distance(mu1, s1, mu2, s2), len(a)
 
 
 # ------------------------------------------------------------- aggregation --
@@ -744,10 +796,11 @@ def reference_str(B_ds, off_b, recv, starts):
     The streamer is the target, so these are what the G(A) columns are
     supposed to move towards.  Metrics 0, 1 and 5 have no meaning against
     itself - 1 and 5 would be exactly 1 and (0, 0), and 0 is the floor,
-    which fid_floor reports separately.
+    which fid_floor reports separately.  The tiles come back with their
+    checkerboard parity, which is what that floor splits on.
     """
     nt, nx = CROP
-    fb, cb, tl = Split(), Split(), [[], []]
+    fb, cb, tl, pr = Split(), Split(), [[], []], [[], []]
     for k in recv:
         for x0 in starts:
             b = take(B_ds, k, 0, x0, nt, nx)
@@ -755,9 +808,12 @@ def reference_str(B_ds, off_b, recv, starts):
             fb.add(inst_freq(b), which_bin(ob))
             cb.add(spectral_centroid(b), which_bin(ob))
             if USE_FD or USE_FID:
-                for i, t in enumerate(tiles(b, ob)):
+                for i, t in enumerate(tiles(b, ob, parity=pr)):
                     tl[i] += t
-    return fb, cb, tl
+    return fb, cb, tl, pr
+
+
+MUTE_PAD = int(round(MUTE_PAD_MS / (DT_S * 1000.0)))
 
 
 def score(transform, A_ds, B_ds, off_a, recv, starts):
@@ -779,6 +835,8 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
             off = off_a[k, x0:x0 + nx]
             bins = which_bin(off)
             fake = transform(a)
+            if REMUTE:
+                remute(fake, a, MUTE_PAD)
 
             br = A_ds.b_row.get(k)
             if B_ds is not None and br is not None:
@@ -803,6 +861,7 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
         rows[name] = dict(
             n_trace=fq.n(b),
             n_pair=ec.n(b),
+            n_tile=0,          # filled in once metric 0 knows its count
             env=nanavg(ec.get(b)),
             if_med=nanmed(fq.get(b)),
             centroid=nanmed(ct.get(b)),
@@ -852,6 +911,9 @@ def main():
     frac = float(np.mean(seen < OFFSET_SPLIT_M))
     print(f"  offset split at {OFFSET_SPLIT_M} m: {100 * frac:.2f} % of the "
           f"scored traces are near, {100 * (1 - frac):.2f} % far")
+    if REMUTE:
+        print(f"  G(A) remuted from the input, {MUTE_PAD_MS:g} ms pad "
+              f"({MUTE_PAD} samples) - the same call translate_das.py makes")
     if B_ds is None:
         print(f"  no streamer counterpart at this stage - metric 1 is nan, "
               f"and the metric 0 reference is the input itself")
@@ -867,12 +929,12 @@ def main():
     print("  scoring the input", flush=True)
     A_tiles, A_rows = score(identity, A_ds, B_ds, off_a, recv, starts)
 
-    S_rows, B_tiles = None, [[], []]
+    S_rows, B_tiles, B_par = None, [[], []], [[], []]
     if B_ds is not None:
         print(f"  scoring the streamer", flush=True)
-        fb, cb, B_tiles = reference_str(B_ds, off_b,
-                                        range(B_ds.n_data), starts)
-        S_rows = {n: dict(n_trace=fb.n(b), n_pair=0, env=np.nan,
+        fb, cb, B_tiles, B_par = reference_str(B_ds, off_b,
+                                               range(B_ds.n_data), starts)
+        S_rows = {n: dict(n_trace=fb.n(b), n_pair=0, n_tile=0, env=np.nan,
                           if_med=nanmed(fb.get(b)),
                           centroid=nanmed(cb.get(b)), dt=np.nan, dx=np.nan,
                           dt_within2=np.nan, peak=np.nan,
@@ -893,6 +955,11 @@ def main():
         # streamer side it is empty; one count for everything made a run come
         # out at n=12, where the floor (14.48) exceeded the distance it was
         # supposed to be the floor of (8.52).
+        n_col = (CROP[1] - FID_PATCH[1]) // FID_PATCH[1] + 1
+        if n_col < 2:
+            print(f"  NOTE the tile grid is one column wide, so the floor's "
+                  f"checkerboard alternates in time only and carries the "
+                  f"time dependence with it - see checker_halves")
         print(f"  metric 0 on {FID_PATCH[0]}x{FID_PATCH[1]} tiles: "
               f"das near {len(A_tiles[0])} / far {len(A_tiles[1])}, "
               f"str near {len(B_tiles[0])} / far {len(B_tiles[1])}")
@@ -902,6 +969,9 @@ def main():
             if FID_MAX_SAMPLES is not None:
                 n = min(n, FID_MAX_SAMPLES)
             fid_n[b] = n if n >= FID_MIN_SAMPLES else 0
+            A_rows[BINS[b]]["n_tile"] = fid_n[b]
+            if S_rows is not None:
+                S_rows[BINS[b]]["n_tile"] = fid_n[b]
             print(f"    {name:>4}  n {n}"
                   + ("" if fid_n[b] else
                      f"  < FID_MIN_SAMPLES {FID_MIN_SAMPLES}, metric 0 is "
@@ -920,37 +990,45 @@ def main():
         for b, name in enumerate(BINS):
             if not fid_n[b]:
                 continue
-            src = ref[b] if len(ref[b]) >= fid_n[b] else ref[1]
+            j = b if len(ref[b]) >= fid_n[b] else 1
+            src, par = ref[j], B_par[j]
             B_fd[name] = fd_stats(src, fid_n[b])
             A_rows[name]["fd"] = (
                 calculate_frechet_distance(*fd_stats(A_tiles[b], fid_n[b]),
                                            *B_fd[name])
                 if A_tiles[b] else np.nan)
-            if S_rows is not None and len(src) >= 2 * FID_MIN_SAMPLES:
+            if S_rows is not None and len(par) == len(src):
                 # the str row carries the floor: the same distribution
                 # against itself, which is what a perfect G(A) would score
-                S_rows[name]["fd"], zn = fd_floor(src, fid_n[b])
+                S_rows[name]["fd"], zn = fd_floor(src, par, fid_n[b])
                 S_rows[name]["floor_n"] = zn
     if use_fid:
         inception = InceptionNetwork().eval().to(DEVICE)
         for b, name in enumerate(BINS):
             if not fid_n[b]:
                 continue
-            src = ref[b] if len(ref[b]) >= fid_n[b] else ref[1]
+            j = b if len(ref[b]) >= fid_n[b] else 1
+            src, par = ref[j], B_par[j]
             B_stats[name] = fid_stats(src, fid_n[b], inception)
             A_rows[name]["fid"] = (
                 calculate_frechet_distance(
                     *fid_stats(A_tiles[b], fid_n[b], inception),
                     *B_stats[name])
                 if A_tiles[b] else np.nan)
-            if S_rows is not None and len(src) >= 2 * FID_MIN_SAMPLES:
-                S_rows[name]["fid"], zn = fid_floor(src, fid_n[b], inception)
+            if S_rows is not None and len(par) == len(src):
+                S_rows[name]["fid"], zn = fid_floor(src, par, fid_n[b],
+                                                   inception)
                 S_rows[name]["floor_n"] = zn
     del A_tiles, B_tiles, ref
 
+    # Three counts, because the metrics do not share a unit.  `n trace` is
+    # what 2, 3 and 5 saw; `n pair` the subset of those with a streamer
+    # counterpart, which is all metric 1 has; `n tile` the 128 x 128 patches
+    # each set was reduced to for metric 0.  A FD or FID means nothing
+    # without the last one - both grow as it falls.
     hdr = ("what", "bin", "FD", "FID", "env corr", "inst f", "centroid",
-           "dt", "dx", "|dt|<=2", "peak", "n", "n pair")
-    w = [7, 6, 8, 9, 10, 9, 10, 7, 7, 9, 7, 8, 8]
+           "dt", "dx", "|dt|<=2", "peak", "n trace", "n pair", "n tile")
+    w = [7, 6, 8, 9, 10, 9, 10, 7, 7, 9, 7, 9, 8, 8]
 
     def emit(label, table):
         for b, name in enumerate(BINS):
@@ -962,8 +1040,8 @@ def main():
                   f"{fmt(r['centroid'], 10, 1, 'H')}"
                   f"{fmt(r['dt'], 7, 1)}{fmt(r['dx'], 7, 1)}"
                   f"{fmt(100 * r['dt_within2'], 9, 0, '%')}"
-                  f"{fmt(r['peak'], 7, 3)}{r['n_trace']:>8}"
-                  f"{r['n_pair']:>8}", flush=True)
+                  f"{fmt(r['peak'], 7, 3)}{r['n_trace']:>9}"
+                  f"{r['n_pair']:>8}{r['n_tile']:>8}", flush=True)
             rows.append((label, name, r))
 
     print("")
@@ -988,6 +1066,7 @@ def main():
         fake_tiles, m = score(translator(g), A_ds, B_ds, off_a, recv, starts)
         for b, name in enumerate(BINS):
             ok = fid_n[b] and len(fake_tiles[b]) >= fid_n[b]
+            m[name]["n_tile"] = fid_n[b] if ok else 0
             m[name]["fd"] = (
                 calculate_frechet_distance(*fd_stats(fake_tiles[b], fid_n[b]),
                                            *B_fd[name])
