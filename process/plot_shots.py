@@ -25,17 +25,18 @@ from utils.data import get_project_root
 
 # Array to plot.  A relative path resolves against the project root, not the
 # working directory, so this works the same however the script is launched.
-NPY_PATH = os.path.join("data", "pohang_shore", "numpy", "str_data_raw.npy")
+# NPY_PATH = os.path.join("data", "pohang_shore", "numpy", "str_data_raw.npy")
+NPY_PATH = os.path.join("data", "pohang_shore", "das_data_fake_str.npy")
 
 # Which shots: every STEP-th from START up to STOP (STOP = None -> to the end).
 STEP = 10
 START = 0
 STOP = None
 
-# Sample interval of the array, for the time axis in seconds.  str_data_raw.npy
-# is on the SEG-Y's own 0.5 ms grid; set 1.0 once it has been resampled onto
-# the DAS grid.
-DT_MS = 0.5
+# Sample interval of the array, for the time axis in seconds.  1.0 for
+# anything from `line` onwards, including das_data_fake_str.npy; 0.5 only for
+# str_data_raw.npy, which is still on the SEG-Y's own grid.
+DT_MS = 1.0
 
 # Colour clip: symmetric at this percentile of |amplitude|.
 PERC = 99.0
@@ -47,9 +48,11 @@ GLOBAL_CLIP = False
 
 CMAP = "seismic"
 
-# Tiled layout.  ONE_BY_ONE = True instead opens one full-size figure per shot.
+# One full-size figure per shot, shown and closed one at a time.  False tiles
+# them NCOLS wide on a single figure instead, which is the cheaper way to scan
+# a whole survey but too small to judge a waveform on.
+ONE_BY_ONE = True
 NCOLS = 8
-ONE_BY_ONE = False
 
 # Annotate each panel with the source-to-array offset, read from the
 # <NPY_PATH stem>_meta.npz written by make_streamer_npy.py.  Ignored if that
