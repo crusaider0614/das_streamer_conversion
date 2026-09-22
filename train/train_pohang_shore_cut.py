@@ -122,6 +122,7 @@ def train(rank, world_size, CF):
     # that used to be here belonged to the signal/noise decomposition and now
     # live in train_pohang_shore_cut_decomp.py.
     nce_criterion = PatchNCELoss().to(rank)
+    value_criterion = nn.L1Loss().to(rank)
 
     # Optimizer
     optimizer_G = optim.AdamW(chain(G_A2B.parameters(), PF.parameters()), lr=CF.TRAIN.GEN_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2), weight_decay=1e-4)
@@ -173,7 +174,8 @@ def train(rank, world_size, CF):
     scaler = GradScaler(device="cuda")
     noise_level = CF.DATASET.NOISE * (CF.DATASET.NOISE_DECAY ** CF.TRAIN.BEGIN_EPOCH)
     ema_coeff = 0.99
-    avg_idt_loss = ValueTracker(ema_coeff)
+    avg_idt_nce_loss = ValueTracker(ema_coeff)
+    avg_idt_l1_loss = ValueTracker(ema_coeff)
     avg_nce_loss = ValueTracker(ema_coeff)
     avg_G_loss = ValueTracker(ema_coeff)
     avg_D_B_loss = ValueTracker(ema_coeff)
@@ -185,7 +187,8 @@ def train(rank, world_size, CF):
             lr_D_B = lr_scheduler_D_B.get_last_lr()
             print(f"epoch: {i_epoch + 1:4d}, learning rate: {lr_G[0]} {lr_D_B[0]}")
         start_time = time.time()
-        avg_idt_loss.initialize()
+        avg_idt_nce_loss.initialize()
+        avg_idt_l1_loss.initialize()
         avg_nce_loss.initialize()
         avg_G_loss.initialize()
         avg_D_B_loss.initialize()
@@ -221,39 +224,46 @@ def train(rank, world_size, CF):
                     nce_loss = patch_nce(nce_criterion, fake_B_projected,
                                          real_A_projected, rank)
 
-                    # B -> B.  CUT's identity term is the SAME PatchNCE run on
+                    # B -> B.  CUT's idttity term is the SAME PatchNCE run on
                     # domain B, not an L1: the generator should leave a real B
                     # alone, and measuring that the same way as the A -> B term
                     # keeps one loss shape rather than mixing an L1 in.  This
                     # is lambda_Y in the paper, LAMBDA_I here; set it to 0 for
                     # the FastCUT variant, which drops this term and the extra
                     # forward with it.
-                    idt_loss = torch.zeros((), device=rank,
+                    idt_nce_loss = torch.zeros((), device=rank,
                                            dtype=torch.float32)
-                    if CF.TRAIN.LAMBDA_I > 0:
+                    idt_l1_loss = torch.zeros((), device=rank,
+                                           dtype=torch.float32)
+                    if CF.TRAIN.LAMBDA_IDT_NCE > 0 or CF.TRAIN.LAMBDA_IDT_L1 > 0:
                         same_B_images, real_B_features = G_A2B(
                             real_B_images, extract_features=True,
                             is_check=True)
-                        same_B_features = G_A2B(same_B_images,
-                                                encode_only=True,
-                                                extract_features=True,
-                                                is_check=True)
-                        real_B_projected, idt_ids = PF(real_B_features)
-                        same_B_projected = PF(same_B_features,
-                                              patch_ids=idt_ids)
-                        idt_loss = patch_nce(nce_criterion, same_B_projected,
-                                             real_B_projected, rank)
+                        idt_l1_loss = value_criterion(same_B_images, real_B_images)
 
-                    fake_B_logits = D_B(fake_B_images)
+                        if CF.TRAIN.LAMBDA_IDT_NCE > 0:
+                            same_B_features = G_A2B(same_B_images,
+                                                    encode_only=True,
+                                                    extract_features=True,
+                                                    is_check=True)
+                            real_B_projected, idt_ids = PF(real_B_features)
+                            same_B_projected = PF(same_B_features, patch_ids=idt_ids)
+                            idt_nce_loss = patch_nce(nce_criterion, same_B_projected, real_B_projected, rank)
+
+                    fake_B_logits = D_B(
+                        fake_B_images
+                        + noise_level * torch.randn_like(fake_B_images))
                     GAN_loss = -fake_B_logits.mean()
 
                     G_loss = (
                         CF.TRAIN.LAMBDA_ADV * GAN_loss +
-                        CF.TRAIN.LAMBDA_N * nce_loss +
-                        CF.TRAIN.LAMBDA_I * idt_loss
+                        CF.TRAIN.LAMBDA_CONV_NCE * nce_loss +
+                        CF.TRAIN.LAMBDA_IDT_NCE * idt_nce_loss +
+                        CF.TRAIN.LAMBDA_IDT_L1 * idt_l1_loss
                     )
 
-                avg_idt_loss.feed(idt_loss.detach().item())
+                avg_idt_nce_loss.feed(idt_nce_loss.detach().item())
+                avg_idt_l1_loss.feed(idt_l1_loss.detach().item())
                 avg_nce_loss.feed(nce_loss.detach().item())
                 avg_G_B_loss.feed(fake_B_logits.detach().mean().item())
                 avg_G_loss.feed(G_loss.detach().item())
@@ -291,10 +301,11 @@ def train(rank, world_size, CF):
                 scaler.update()
 
                 if rank == 0 and ((i_batch + 1) % 10 == 0 or (i_batch + 1) == n_batch):
-                    print("epoch: {:4}, batch: {:4}, idt_nce: {:8.2e}, nce_loss: {:8.2e}, G_loss: {:9.2e}, B_score: {:7.4f}, {:7.4f}".format(
+                    print("epoch: {:4}, batch: {:4}, idt_nce: {:8.2e}, idt_l1: {:8.2e}, nce_loss: {:8.2e}, G_loss: {:9.2e}, B_score: {:7.4f}, {:7.4f}".format(
                         i_epoch + 1,
                         i_batch + 1,
-                        avg_idt_loss.val(),
+                        avg_idt_nce_loss.val(),
+                        avg_idt_l1_loss.val(),
                         avg_nce_loss.val(),
                         avg_G_loss.val(),
                         avg_D_B_loss.val(),
@@ -307,7 +318,7 @@ def train(rank, world_size, CF):
 
         if rank == 0:
             if True:
-                idt_losses.append(avg_idt_loss.val())
+                idt_losses.append(avg_idt_nce_loss.val())
                 nce_losses.append(avg_nce_loss.val())
                 G_losses.append(avg_G_loss.val())
                 D_B_losses.append(avg_D_B_loss.val())

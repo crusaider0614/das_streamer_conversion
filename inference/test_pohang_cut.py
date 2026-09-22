@@ -21,7 +21,20 @@ def show_in_plot(imgs, perc=0.95):
     plt.show()
 
 
-epoch = 130
+def show_four(panels, names=("real A", "fake B", "real B", "same B"), clip=1.0):
+    """네 패널을 축 없이, 확대하면 같은 위치가 보이도록 공유 축으로."""
+    fig, axs = plt.subplots(1, 4, figsize=(16, 6), sharex=True, sharey=True)
+    for ax, img, name in zip(axs, panels, names):
+        ax.imshow(img, cmap="seismic", vmin=-clip, vmax=clip,
+                  aspect="auto", interpolation="nearest")
+        ax.set_title(name, fontsize=9)
+        ax.set_axis_off()
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.01,
+                        wspace=0.02)
+    plt.show()
+
+
+epoch = 150
 
 # Define
 config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut.yaml")
@@ -84,49 +97,5 @@ with torch.no_grad():
         fake_B_numpy = fake_B_image.cpu().numpy().squeeze()
         real_B_numpy = real_B_image.cpu().numpy().squeeze()
         same_B_numpy = same_B_image.cpu().numpy().squeeze()
-        tb = -np.ones((real_A_numpy.shape[0], 4), dtype=np.float32)
 
-        imgs = np.concatenate((
-            real_A_numpy, tb,
-            fake_B_numpy, tb,
-            real_B_numpy, tb,
-            same_B_numpy,
-        ), axis=1)
-
-        print(real_A_image.min(), real_A_image.max())
-        print(fake_B_image.min(), fake_B_image.max())
-        print(real_B_image.min(), real_B_image.max())
-        print(same_B_image.min(), same_B_image.max())
-
-        show_2d_array(imgs, vmax=1.0, vmin=-1.0)
-
-    # fake_imgs = fake_imgs.squeeze()
-    # fig = plt.figure()
-    # fig.set_size_inches((fake_imgs.shape[1] / 100, fake_imgs.shape[0] / 100 - 0.375))
-    # ax = plt.Axes(fig, [0., 0., 1., 1.])
-    # ax.set_axis_off()
-    # fig.add_axes(ax)
-    # plt.imshow(fake_imgs, cmap="gray", vmax=0.5, vmin=-0.5)
-    # plt.show()
-
-    # for ix in [10, 50, 90, 130, 170, 210]:
-    #     fig = plt.figure()
-    #     fig.set_size_inches((3 * fake_imgs.shape[2] / 100, fake_imgs.shape[0] / 100 - 0.375))
-    #     ax = plt.Axes(fig, [0., 0., 1., 1.])
-    #     ax.set_axis_off()
-    #     fig.add_axes(ax)
-    #     plt.imshow(np.concatenate((real_A_imgs[:, ix], real_B_imgs[:, ix], fake_imgs[:, ix]), axis=1), cmap="gray", vmax=0.5, vmin=-0.5)
-    #     plt.show()
-
-    # for ix in [10, 50, 90, 130, 170, 210]:
-    #     real_B_image = torch.tensor(real_B_imgs[None, None, :, ix], dtype=torch.float32)
-    #     print(real_B_image.shape)
-    #     fake_A_image = G_B2A(real_B_image, B_center, c_delta)
-    #     fig = plt.figure()
-    #     fig.set_size_inches((3 * real_A_imgs.shape[2] / 100, real_A_imgs.shape[0] / 100 - 0.375))
-    #     ax = plt.Axes(fig, [0., 0., 1., 1.])
-    #     ax.set_axis_off()
-    #     fig.add_axes(ax)
-    #     plt.imshow(np.concatenate((real_A_imgs[:, ix], real_B_imgs[:, ix], fake_A_image.cpu().numpy().squeeze()), axis=1), cmap="gray", vmax=0.5, vmin=-0.5)
-    #     plt.show()
-
+        show_four((real_A_numpy, fake_B_numpy, real_B_numpy, same_B_numpy), clip=0.5)

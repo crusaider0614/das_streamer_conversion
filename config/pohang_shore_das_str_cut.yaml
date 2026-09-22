@@ -1,7 +1,7 @@
 # CUT (contrastive unpaired translation) variant on the anisotropic generator.
 # Used by `python -m train.train_pohang_shore_cut` and by
 # `python -m inference.test_pohang_cut` / `test_pohang_cut_compare`.
-TAG: "pohang_shore_das_str_cut"
+TAG: "pohang_shore_das_str_cut_iden"
 CUDNN_BENCHMARK: True
 SEED: 19467
 DEVICE: "cuda"
@@ -10,30 +10,30 @@ GPUS: [ 4, 5, 6, 7 ]
 PRETRAIN:
   LOAD: False
   TAG: "pohang_shore_das_str_cut"
-  LOAD_EPOCH: 120
+  LOAD_EPOCH: 200
   LOAD_OPTIMIZER: True
 
 DATASET:
-  CROP_SIZE: [ 512, 128 ]
-  NUM_DATA: 10000
+  CROP_SIZE: [ 2000, 128 ]
+  NUM_DATA: 4000
   NOISE: 0.01
-  NOISE_DECAY: 0.995
+  NOISE_DECAY: 1.0
 
 MODEL:
   A_CHANNELS: 1        # DAS
   B_CHANNELS: 1        # streamer
   OUT_CHANNELS: 1
-  GEN_CHANNELS: 32
+  GEN_CHANNELS: 64
   GEN_NORM: True
   GEN_SPEC: False
   GEN_CBAM: True
-  DIS_CHANNELS: 32
+  DIS_CHANNELS: 64
   DIS_NORM: False
   DIS_SPEC: True
   DIS_CBAM: True
 
 TRAIN:
-  BATCH_SIZE: 20
+  BATCH_SIZE: 16
   ITER_PER_EPOCH: 1
   BEGIN_EPOCH: 0
   END_EPOCH: 200
@@ -42,7 +42,8 @@ TRAIN:
   DIS_LR: 0.00005
   BETA1: 0.5
   BETA2: 0.999
-  LAMBDA_I: 0.5        # identity loss
-  LAMBDA_ADV: 1.0      # adversarial loss
-  LAMBDA_N: 0.5        # PatchNCE loss
+  LAMBDA_IDT_NCE: 0.5       # identity loss
+  LAMBDA_IDT_L1: 1.0
+  LAMBDA_ADV: 1.0           # adversarial loss
+  LAMBDA_CONV_NCE: 0.5      # PatchNCE loss
   LAMBDA_SSIM: 1.0
