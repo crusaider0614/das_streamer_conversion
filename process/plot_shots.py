@@ -19,6 +19,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+import config as C
 from utils.data import get_project_root
 
 # ---------------------------------------------------------------- settings --
@@ -53,6 +54,27 @@ CMAP = "seismic"
 # a whole survey but too small to judge a waveform on.
 ONE_BY_ONE = True
 NCOLS = 8
+
+# Draw the generator's input beside its output, on shared axes, so a zoom or a
+# pan on one panel moves the other with it and the same samples stay side by
+# side.  ONE_BY_ONE only - two panels per shot do not tile usefully.
+#
+#   "rg"    the arrays the generator was actually given,
+#           das_data_rg_{train,infer}.npy, put back into receiver order.  This
+#           is the right comparison for das_data_fake_str.npy: same log
+#           envelope gain, same shot order, same receivers, so the only
+#           difference on screen is the translation.
+#   a path  any other shot-major (shots, samples, channels) array.  Watch the
+#           shot order - everything from `deci` and `norm` is in RECORDING
+#           order while the rg arrays and the translated file are SORTED along
+#           the line, so shot i is not the same shot in both.
+#   None    no second panel.
+COMPARE = "rg"
+
+# Each panel is clipped on its own even when GLOBAL_CLIP is set, because the
+# two sides do not share a scale: the translated file comes back through the
+# streamer's value_range, the input never left the DAS's.
+COMPARE_PERC = PERC
 
 # Annotate each panel with the source-to-array offset, read from the
 # <NPY_PATH stem>_meta.npz written by make_streamer_npy.py.  Ignored if that
@@ -93,6 +115,76 @@ def load_offsets(npy_path, n_shots):
               f"there vs {n_shots} in the array)")
         return None
     return np.hypot(*(src - rcv.mean(axis=0)).T)
+
+
+def shared_split(rec_xy):
+    """Receiver indices inside / outside the streamer's aperture.
+
+    The same rule as process/logenv_process.shared_receivers, by position
+    rather than by index range, so this agrees with whatever split wrote the
+    two arrays.
+    """
+    m = np.load(resolve(C.META["str_line"]))
+    a_rec = (rec_xy - m["line_centroid"]) @ m["line_direction"]
+    a_str = (m["receiver_xy"] - m["line_centroid"]) @ m["line_direction"]
+    lo, hi = a_str.min(), a_str.max()
+    return (np.flatnonzero((a_rec >= lo) & (a_rec <= hi)),
+            np.flatnonzero((a_rec < lo) | (a_rec > hi)))
+
+
+class RGShots:
+    """The generator's input, read back as shot gathers.
+
+    das_data_rg_{train,infer}.npy are receiver-major - (receiver, sample,
+    shot) - and split by whether the receiver has a streamer counterpart, so
+    one shot gather is a strided read from each of them, put back in receiver
+    order.  Indexed [shot] like a shot-major array, which is all the plotting
+    needs.
+    """
+
+    def __init__(self):
+        paths = [resolve(C.ARRAYS["das"][k]) for k in ("rg_train", "rg_infer")]
+        missing = [q for q in paths if not os.path.isfile(q)]
+        if missing:
+            raise SystemExit("not found: " + ", ".join(missing))
+        self.arrays = [np.load(q, mmap_mode="r") for q in paths]
+        rec = np.load(resolve(C.META["das_deci"]))["receiver_xy"]
+        self.inside, self.outside = shared_split(rec)
+        self.n_recv = len(rec)
+        if (len(self.inside) != self.arrays[0].shape[0]
+                or len(self.outside) != self.arrays[1].shape[0]):
+            raise SystemExit(
+                f"split gives {len(self.inside)}/{len(self.outside)}, the "
+                f"arrays have {self.arrays[0].shape[0]}/"
+                f"{self.arrays[1].shape[0]}")
+        self.shape = (self.arrays[0].shape[2], self.arrays[0].shape[1],
+                      self.n_recv)
+
+    def __getitem__(self, shot):
+        out = np.empty(self.shape[1:], dtype=np.float32)
+        for a, where in zip(self.arrays, (self.inside, self.outside)):
+            out[:, where] = np.asarray(a[:, :, shot]).T
+        return out
+
+
+def open_compare(n_shots):
+    """The second panel's source, or None."""
+    if not COMPARE:
+        return None, ""
+    if COMPARE == "rg":
+        rg = RGShots()
+        if rg.shape[0] != n_shots:
+            raise SystemExit(f"the rg arrays hold {rg.shape[0]} shots, the "
+                             f"array being plotted has {n_shots}")
+        return rg, "input (rg, log envelope)"
+    q = resolve(COMPARE)
+    if not os.path.isfile(q):
+        raise SystemExit(f"not found: {q}")
+    a = np.load(q, mmap_mode="r")
+    if a.shape[0] != n_shots:
+        raise SystemExit(f"{os.path.basename(q)} holds {a.shape[0]} shots, "
+                         f"the array being plotted has {n_shots}")
+    return a, os.path.basename(q)
 
 
 def draw(ax, gather, clip=None):
@@ -137,18 +229,30 @@ def plot_grid(data, indices, offsets, clip):
     plt.show()
 
 
-def plot_one_by_one(data, indices, offsets, clip):
+def plot_one_by_one(data, indices, offsets, clip, other=None, other_name=""):
     for idx in indices:
         gather = np.asarray(data[idx])
-        fig, ax = plt.subplots(figsize=(4, 7))
-        v = draw(ax, gather, clip)
-        ax.set_title(panel_title(idx, offsets).replace("\n", "  -  "))
-        ax.set_xlabel("channel")
-        ax.set_ylabel("time [s]")
-        fig.tight_layout()
+        panels = [(gather, os.path.basename(resolve(NPY_PATH)), clip)]
+        if other is not None:
+            panels.insert(0, (np.asarray(other[idx]), other_name, None))
 
-        print(f"shot {idx:4d}: clip +-{v:.4g}, "
-              f"range [{gather.min():.4g}, {gather.max():.4g}]")
+        # sharex/sharey is what makes a zoom or a pan on one panel move the
+        # other: matplotlib keeps the limits tied, so the same samples stay
+        # opposite each other however far in you go.
+        fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 7),
+                                 sharex=True, sharey=True, squeeze=False)
+        line = f"shot {idx:4d}:"
+        for ax, (img, name, cl) in zip(axes[0], panels):
+            v = draw(ax, img, cl)
+            ax.set_title(name, fontsize=9)
+            ax.set_xlabel("channel")
+            line += (f"  {name} clip +-{v:.4g} "
+                     f"[{img.min():.4g}, {img.max():.4g}]")
+        axes[0, 0].set_ylabel("time [s]")
+        fig.suptitle(panel_title(idx, offsets).replace("\n", "  -  "),
+                     fontsize=11)
+        fig.tight_layout()
+        print(line)
 
         if SAVE_PATH:
             stem, ext = os.path.splitext(resolve(SAVE_PATH))
@@ -188,8 +292,13 @@ def main():
         print(f"  shared clip +-{clip:.4g}")
 
     if ONE_BY_ONE:
-        plot_one_by_one(data, indices, offsets, clip)
+        other, other_name = open_compare(n_shots)
+        if other is not None:
+            print(f"  beside {other_name}")
+        plot_one_by_one(data, indices, offsets, clip, other, other_name)
     else:
+        if COMPARE:
+            print("  (COMPARE is ignored unless ONE_BY_ONE)")
         plot_grid(data, indices, offsets, clip)
 
 
