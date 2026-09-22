@@ -40,7 +40,8 @@ distributions and positions instead.
      cases are indistinguishable (0.148 against 0.100), because what carries
      the pairing is the long-range trend.
          before translation  0.44        shuffled-shot control  0.02
-     Needs a streamer counterpart, so it only exists for STAGE = "rg_train".
+     Needs a streamer counterpart, so it is measured only on the 24
+     receivers that have one - the `n pair` column - whatever STAGE is.
 
   2  instantaneous frequency, median over the envelope's top quartile
      The clearest measured difference between the instruments, and the thing
@@ -91,12 +92,12 @@ passes over it.
 
     near   < 184.1 m     DAS only.  There is no streamer trace at this offset
                          anywhere in the survey, so the near bin has no
-                         reference of its own: FID compares it against the
-                         streamer's far patches and metric 1 does not exist.
-                         Read it as an extrapolation check - the model was
-                         never shown what a streamer looks like here - not as
-                         a score.  With 87 m of water this is also the only
-                         bin that contains the moveout apex.
+                         reference of its own: metric 0 compares it against
+                         the streamer's far patches and metric 1 does not
+                         exist.  Read it as an extrapolation check - the
+                         model was never shown what a streamer looks like
+                         here - not as a score.  With 87 m of water this is
+                         also the only bin that contains the moveout apex.
     far   >= 184.1 m     The band both instruments cover, filled continuously
                          (largest gap between consecutive traces 3.18 m) up to
                          2371 m.
@@ -104,15 +105,33 @@ passes over it.
 Which bin holds what, by trace:
 
                     near        far
-    das all 264    10.90 %    89.10 %
+    das all 264    10.91 %    89.09 %
     das rg_train    0.00 %   100.00 %
     das rg_infer   11.99 %    88.01 %
     str               0        100 %
 
-So STAGE = "rg_train" puts every trace in the far bin and the split does
-nothing: those 24 receivers sit inside the streamer array and inherit its
-geometry exactly.  The near bin only appears at STAGE = "rg_infer", which is
-also where metric 1 disappears.  Run it both ways.
+All 264 receivers, and what that mixes
+--------------------------------------
+STAGE = "all" stacks the two arrays back into receiver order - rg_train at
+12..35, rg_infer either side - because that is the line the model is actually
+run on by inference/translate_das.py, and because it is the only setting where
+the near bin has anything in it.  rg_train alone is 100 % far: those 24
+receivers sit inside the streamer array and inherit its geometry exactly.
+
+Two things come with that.  The 24 trained-on receivers are 9.1 % of the 264,
+so the far bin mixes in-sample with out-of-sample; set STAGE to one array or
+the other to separate them.  And metric 1 needs a streamer counterpart, which
+only those 24 have, so it is measured on them while the rest of the row covers
+all 264 - the table prints both counts, `n` and `n pair`.
+
+The normalisation is pinned to rg_train's clip and `value_range` for every
+receiver.  rg_infer's own divisor is 3.1104 against rg_train's 3.2716, 5 %
+apart, and the generator only ever saw the second.  translate_das.py pins it
+the same way, so these numbers describe the file that script writes.
+
+It is 264 x 4 = 1056 generator passes per checkpoint, eleven times what
+rg_train alone costs.  EVAL_RECEIVERS thins that when a run is only being
+sanity-checked.
 
 Two things worth knowing before reading the numbers
 ---------------------------------------------------
@@ -121,9 +140,12 @@ begins with AdaptiveAvgPool2d(1) and every DecodeBlock's CBAM pools globally,
 so the model sees statistics over whatever extent it is given.  Scoring on the
 full 551-shot gather would hand it an extent it never saw in training.
 
-And there is no held-out set: training uses all 24 receivers of `rg_train`.
-These numbers are therefore in-sample.  EVAL_RECEIVERS exists so a few can be
-held out of the next training run and scored here instead.
+And there is no held-out set on the streamer side: training uses all 24
+receivers of `rg_train`, so metric 1 is in-sample however STAGE is set.  The
+other 240 DAS receivers were never trained against - there is nothing to train
+against there - so the rest of the table is out-of-sample for 90.9 % of its
+traces.  EVAL_RECEIVERS exists so a few of the 24 can be held out of the next
+training run and scored here instead.
 
 Edit the settings block below, then run from the repository root:
 
@@ -152,11 +174,13 @@ from utils.process import envelope_1d
 TAG = "pohang_shore_das_str_cut_iden"
 EPOCHS = None
 
-# Which DAS array to score.  "rg_train" is the 24 receivers the streamer
-# overlaps - the only ones metric 1 and the FID reference exist for, and every
-# trace of them is in the far bin.  "rg_infer" is the other 240, which is
-# where the near bin lives.
-STAGE = "rg_train"
+# Which DAS receivers to score.  "all" is the whole 264-channel line, the two
+# arrays stacked back into receiver order, which is what the model is actually
+# run on and the only setting where both offset bins are populated.
+# "rg_train" is the 24 the streamer overlaps, "rg_infer" the other 240; those
+# two exist for when the in-sample and out-of-sample halves have to be told
+# apart.  See the note on receiver coverage in the header.
+STAGE = "all"
 
 # The window each metric is measured on.  Match the training CROP_SIZE - see
 # the note about global pooling above.
@@ -298,6 +322,8 @@ def offsets(stage):
 
     z = np.load(resolve(C.META["das_deci"]))
     off = z["offset_m"][order].T.astype(np.float64)
+    if stage == "all":
+        return off
     inside, outside = shared_split(z["receiver_xy"])
     keep = inside if stage == "rg_train" else outside
     return off[keep]
@@ -309,6 +335,74 @@ def which_bin(offset):
 
 
 # ------------------------------------------------------------- the windows --
+
+
+class Stack:
+    """(264, n_samp, n_shot) view over the two DAS arrays, by receiver index.
+
+    Indexed [k, t_slice, x_slice] like one memmap would be, so nothing
+    downstream has to know the receivers arrive in two files.
+    """
+
+    def __init__(self, arrays, owner, row):
+        self.arrays, self.owner, self.row = arrays, owner, row
+
+    def __getitem__(self, key):
+        k, rest = key[0], tuple(key[1:])
+        return self.arrays[self.owner[k]][(self.row[k],) + rest]
+
+
+class Gathers:
+    """The DAS side, with the normalisation pinned to what training used.
+
+    The clip percentiles and `value_range` are rg_train's for every receiver.
+    Each array's own would differ - 3.2716 against rg_infer's 3.1104, 5 %
+    apart - and feeding the generator a differently scaled version of the
+    same instrument is a scaling it never saw.  inference/translate_das.py
+    pins them the same way, so the scores describe the file that script
+    writes.
+    """
+
+    def __init__(self, stage):
+        train = PohangShoreDataset(is_das=True, crop_size=None,
+                                   total_length=1, stage="rg_train")
+        self.lower_clip = train.lower_clip
+        self.upper_clip = train.upper_clip
+        self.value_range = train.value_range
+
+        if stage == "rg_train":
+            arrays, order = [train.data], None
+        elif stage == "rg_infer":
+            infer = PohangShoreDataset(is_das=True, crop_size=None,
+                                       total_length=1, stage="rg_infer")
+            arrays, order = [infer.data], None
+        elif stage == "all":
+            infer = PohangShoreDataset(is_das=True, crop_size=None,
+                                       total_length=1, stage="rg_infer")
+            arrays = [train.data, infer.data]
+            rec = np.load(resolve(C.META["das_deci"]))["receiver_xy"]
+            inside, outside = shared_split(rec)
+            order = (len(rec), inside, outside)
+        else:
+            raise SystemExit(f"STAGE {stage!r} is not one of all / rg_train "
+                             f"/ rg_infer")
+
+        if order is None:
+            n = arrays[0].shape[0]
+            self.data = Stack(arrays, np.zeros(n, int), np.arange(n))
+            self.b_row = ({k: k for k in range(n)} if stage == "rg_train"
+                          else {})
+        else:
+            n, inside, outside = order
+            owner, row = np.empty(n, int), np.empty(n, int)
+            owner[inside], row[inside] = 0, np.arange(len(inside))
+            owner[outside], row[outside] = 1, np.arange(len(outside))
+            self.data = Stack(arrays, owner, row)
+            # receiver index -> row of the streamer array, where one exists
+            self.b_row = {int(k): i for i, k in enumerate(inside)}
+
+        self.n_data = n if order is not None else arrays[0].shape[0]
+        self.n_samp, self.n_shot = arrays[0].shape[1], arrays[0].shape[2]
 
 
 def take(ds, k, t0, x0, nt, nx):
@@ -659,8 +753,9 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
             bins = which_bin(off)
             fake = transform(a)
 
-            if B_ds is not None:
-                b = take(B_ds, k, 0, x0, nt, nx)
+            br = A_ds.b_row.get(k)
+            if B_ds is not None and br is not None:
+                b = take(B_ds, br, 0, x0, nt, nx)
                 ec.add(envelope_corr(fake, b), bins)      # metric 1
             fq.add(inst_freq(fake), bins)                 # metric 2
             ct.add(spectral_centroid(fake), bins)         # metric 3
@@ -679,7 +774,8 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
     for b, name in enumerate(BINS):
         d = dt_.get(b)
         rows[name] = dict(
-            n_trace=ec.n(b) if B_ds is not None else fq.n(b),
+            n_trace=fq.n(b),
+            n_pair=ec.n(b),
             env=nanavg(ec.get(b)),
             if_med=nanmed(fq.get(b)),
             centroid=nanmed(ct.get(b)),
@@ -702,11 +798,9 @@ def main():
         raise SystemExit(f"no checkpoints named {TAG}_<epoch> under "
                          f"{resolve('checkpoint')}")
 
-    A_ds = PohangShoreDataset(is_das=True, crop_size=None, total_length=1,
-                              stage=STAGE)
+    A_ds = Gathers(STAGE)
     B_ds = (PohangShoreDataset(is_das=False, crop_size=None, total_length=1,
-                               stage="rg_train")
-            if STAGE == "rg_train" else None)
+                               stage="rg_train") if A_ds.b_row else None)
     off_a = offsets(STAGE)
     off_b = offsets("str") if B_ds is not None else None
     if off_a.shape[0] != A_ds.n_data or off_a.shape[1] != A_ds.n_shot:
@@ -727,7 +821,11 @@ def main():
           f"scored traces are near, {100 * (1 - frac):.2f} % far")
     if B_ds is None:
         print(f"  no streamer counterpart at this stage - metric 1 is nan, "
-              f"and the FID reference is the streamer's far patches")
+              f"and the metric 0 reference is the input itself")
+    elif len(A_ds.b_row) < len(recv):
+        print(f"  {len(A_ds.b_row)} of {len(recv)} receivers have a streamer "
+              f"counterpart; metric 1 is measured on those, the rest of the "
+              f"table on all of them")
 
     # The input, through the same code path as a checkpoint.  This is the row
     # every other row is read against: what the metrics say when nothing has
@@ -739,8 +837,9 @@ def main():
     S_rows, B_tiles = None, [[], []]
     if B_ds is not None:
         print(f"  scoring the streamer", flush=True)
-        fb, cb, B_tiles = reference_str(B_ds, off_b, recv, starts)
-        S_rows = {n: dict(n_trace=fb.n(b), env=np.nan,
+        fb, cb, B_tiles = reference_str(B_ds, off_b,
+                                        range(B_ds.n_data), starts)
+        S_rows = {n: dict(n_trace=fb.n(b), n_pair=0, env=np.nan,
                           if_med=nanmed(fb.get(b)),
                           centroid=nanmed(cb.get(b)), dt=np.nan, dx=np.nan,
                           dt_within2=np.nan, peak=np.nan,
@@ -799,8 +898,8 @@ def main():
     del A_tiles, B_tiles, ref
 
     hdr = ("what", "bin", "FD", "FID", "env corr", "inst f", "centroid",
-           "dt", "dx", "|dt|<=2", "peak", "n")
-    w = [7, 6, 8, 9, 10, 9, 10, 7, 7, 9, 7, 8]
+           "dt", "dx", "|dt|<=2", "peak", "n", "n pair")
+    w = [7, 6, 8, 9, 10, 9, 10, 7, 7, 9, 7, 8, 8]
 
     def emit(label, table):
         for b, name in enumerate(BINS):
@@ -812,7 +911,8 @@ def main():
                   f"{fmt(r['centroid'], 10, 1, 'H')}"
                   f"{fmt(r['dt'], 7, 1)}{fmt(r['dx'], 7, 1)}"
                   f"{fmt(100 * r['dt_within2'], 9, 0, '%')}"
-                  f"{fmt(r['peak'], 7, 3)}{r['n_trace']:>8}", flush=True)
+                  f"{fmt(r['peak'], 7, 3)}{r['n_trace']:>8}"
+                  f"{r['n_pair']:>8}", flush=True)
             rows.append((label, name, r))
 
     print("")
