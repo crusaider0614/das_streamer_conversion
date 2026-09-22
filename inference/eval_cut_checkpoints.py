@@ -574,7 +574,7 @@ def lag_over(fake, real, off):
 # --------------------------------------------------------------- metric 0 --
 
 
-def tiles(gather, off, live_from=None, parity=None):
+def tiles(gather, off, live_from=None, parity=None, phase=0):
     """Non-overlapping FID_PATCH tiles of one window, mute ones dropped.
 
     `live_from` is the gather liveness is judged on, when that is not the
@@ -585,9 +585,11 @@ def tiles(gather, off, live_from=None, parity=None):
 
     Binned like the lag sub-windows, by the tile's smallest offset.
 
-    `parity` collects each tile's square on the checkerboard, (row + column)
-    mod 2 of its place in the window's own grid.  Only the floor uses it -
-    see `checker_halves`.
+    `parity` collects each tile's square on the checkerboard, (row + column
+    + phase) mod 2 of its place in the window's own grid.  `phase` is the
+    window's ordinal, so the colours invert from one shot window to the next
+    and the pattern is a checkerboard across the windows as well as inside
+    them.  Only the floor uses it - see `checker_halves`.
     """
     nt, nx = FID_PATCH
     mask = gather if live_from is None else live_from
@@ -600,7 +602,7 @@ def tiles(gather, off, live_from=None, parity=None):
                 out[b].append(np.asarray(gather[t0:t0 + nt, x0:x0 + nx],
                                          dtype=np.float32))
                 if parity is not None:
-                    parity[b].append((it + ix) % 2)
+                    parity[b].append((it + ix + phase) % 2)
     return out
 
 
@@ -678,15 +680,29 @@ def checker_halves(patches, parity, n):
     estimate the other splits give.  Used only for the streamer, which is the
     only set a floor is measured on.
 
-    It needs both axes to have more than one square.  The window is 128 shots
-    and so is the patch, so as things stand the grid is 15 x 1 and the
-    "checkerboard" is alternating slabs of TIME - even tiles at 0-128,
-    256-384, ... against odd ones at 128-256, 384-512, ... Seismic character
-    depends strongly on absolute time, so that is a systematic difference and
-    the floor picks it up: measured 0.87 on the FD where the shuffled split
-    gives 0.11.  Two or more columns - which tiling the shot axis more
-    densely than the patch would give - put every time row in both halves and
-    the imbalance cancels.  main() says so when the grid is one column wide.
+    The window is 128 shots and so is the patch, so the grid inside one
+    window is 15 x 1 and a checkerboard drawn there alone would alternate in
+    TIME only - even tiles at 0-128, 256-384, ... against odd ones at
+    128-256, 384-512, ... Seismic character depends strongly on absolute
+    time, so that is a systematic difference, and it showed: 0.87 on the FD
+    where a shuffled split gives 0.11.
+
+    So the colours also invert from one shot window to the next.  Every time
+    row then appears in both halves - parity (i + w) mod 2 over the four
+    windows w is white, black, white, black for row i and the opposite for
+    row i + 1 - and the time imbalance cancels without needing a second
+    column of tiles.  The windows do not overlap (starts 0, 141, 282, 423,
+    width 128), so no tile shares a sample with a tile of the other colour.
+
+    Measured on the streamer's 839 far tiles: 0.18 on the FD, against 0.11
+    shuffled and 0.87 for a checkerboard inside the windows alone.  What is
+    left is the shallowest two rows, 384-512 and 512-640 ms, which survive
+    the live filter in only one window each and so land 24/0 and 0/24; they
+    are 48 of the 839.  Adding the receiver index to the parity balances
+    them exactly (419/420) and takes the floor to 0.011, but that is too
+    good: streamer nodes are 3 m apart, so it puts each tile's nearest
+    neighbour in the other half and the two halves become near-duplicates.
+    0.18 is the honest number of the three.
     """
     p = np.asarray(patches, dtype=np.float32)
     q = np.asarray(parity, dtype=int)
@@ -802,13 +818,13 @@ def reference_str(B_ds, off_b, recv, starts):
     nt, nx = CROP
     fb, cb, tl, pr = Split(), Split(), [[], []], [[], []]
     for k in recv:
-        for x0 in starts:
+        for w, x0 in enumerate(starts):
             b = take(B_ds, k, 0, x0, nt, nx)
             ob = off_b[k, x0:x0 + nx]
             fb.add(inst_freq(b), which_bin(ob))
             cb.add(spectral_centroid(b), which_bin(ob))
             if USE_FD or USE_FID:
-                for i, t in enumerate(tiles(b, ob, parity=pr)):
+                for i, t in enumerate(tiles(b, ob, parity=pr, phase=w)):
                     tl[i] += t
     return fb, cb, tl, pr
 
@@ -955,11 +971,6 @@ def main():
         # streamer side it is empty; one count for everything made a run come
         # out at n=12, where the floor (14.48) exceeded the distance it was
         # supposed to be the floor of (8.52).
-        n_col = (CROP[1] - FID_PATCH[1]) // FID_PATCH[1] + 1
-        if n_col < 2:
-            print(f"  NOTE the tile grid is one column wide, so the floor's "
-                  f"checkerboard alternates in time only and carries the "
-                  f"time dependence with it - see checker_halves")
         print(f"  metric 0 on {FID_PATCH[0]}x{FID_PATCH[1]} tiles: "
               f"das near {len(A_tiles[0])} / far {len(A_tiles[1])}, "
               f"str near {len(B_tiles[0])} / far {len(B_tiles[1])}")
