@@ -82,6 +82,10 @@ ARRAYS = {
         # Written by process/logenv_process.py.
         "rg_train": os.path.join(DATA_DIR, "das_data_rg_train.npy"),
         "rg_infer": os.path.join(DATA_DIR, "das_data_rg_infer.npy"),
+        # G_A2B run over the whole line and written back shot-major, by
+        # inference/translate_das.py.  In the streamer log-envelope domain -
+        # inference/plot_translated_shots.py takes that gain off again.
+        "fake_str": os.path.join(DATA_DIR, "das_data_fake_str.npy"),
     },
     "str": {
         "raw": os.path.join(NPY_DIR, "str_data_raw.npy"),

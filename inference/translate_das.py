@@ -70,7 +70,7 @@ CONFIG = os.path.join("config", "pohang_shore_das_str_cut.yaml")
 EPOCH = 150
 
 # Where the result goes, relative to the project root.
-OUT_NPY = os.path.join("data", "pohang_shore", "das_data_fake_str.npy")
+OUT_NPY = C.ARRAYS["das"]["fake_str"]
 
 # The window the generator sees, (samples, shots).  Match the training
 # CROP_SIZE; the time entry has to be the full record.
