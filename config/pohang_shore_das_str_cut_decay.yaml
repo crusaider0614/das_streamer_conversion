@@ -24,7 +24,8 @@ PRETRAIN:
   TAG: "pohang_shore_das_str_cut_iden"
   LOAD_EPOCH: 150
   # Adam's moments carry over; the lr schedule deliberately does not.  See the
-  # train script's header for why restoring it would pin the rate at zero.
+  # train script's header - restoring it would freeze the rate at full and the
+  # decay would silently never happen.
   LOAD_OPTIMIZER: True
 
 DATASET:

@@ -32,12 +32,19 @@ How many epochs the decay is spread over, counted from where training starts.
 0 or absent keeps the constant rate, so this file behaves exactly like its
 parent unless the config asks for something else.
 
-Resuming needs one care.  The checkpoint carries the old scheduler's state
-with `last_epoch` at whatever epoch it was saved, and feeding that to a fresh
-LinearLR whose `total_iters` is the decay span would put it straight at the end
-of the schedule - a learning rate of zero from the first step.  So when a decay
-is configured the optimizer state is restored and the scheduler state is not:
-Adam keeps its moments, the schedule starts at full rate.
+Resuming needs one care, and it fails silently rather than loudly.  The
+checkpoint carries the old scheduler's state with `last_epoch` at the epoch it
+was saved - 150 here - and LinearLR's step is multiplicative: it scales the
+group's current rate by the ratio between consecutive factors, and once
+`last_epoch` is past `total_iters` that ratio is exactly 1.0.  Loading that
+state into a fresh LinearLR whose span is 50 epochs therefore does not clamp
+the rate to zero, it freezes it at full rate for all 50 - measured, 1e-4 every
+epoch, which is the parent run again under a different tag.
+
+So when a decay is configured the optimizer state is restored and the
+scheduler state is not: Adam keeps its moments, the schedule starts at full
+rate and actually moves.  Measured that way it runs 1.0e-4, 9.8e-5, 9.6e-5,
+... 2.0e-6 across the 50 epochs.
 
     python -m train.train_pohang_shore_cut_decay
 """
@@ -212,8 +219,9 @@ def train(rank, world_size, CF):
             optimizer_D_B.load_state_dict(state["optimizer_D_B"])
 
             # Not the scheduler, when a decay is configured: its saved
-            # `last_epoch` would land a fresh LinearLR at the end of its own
-            # schedule and hold the rate at zero.  See the header.
+            # `last_epoch` is past the decay span, and LinearLR's step is
+            # multiplicative, so the factor would be 1.0 every epoch and the
+            # rate would never move.  See the header.
             if decay_epochs <= 0:
                 lr_scheduler_G.load_state_dict(state["lr_scheduler_G"])
                 lr_scheduler_D_B.load_state_dict(state["lr_scheduler_D_B"])
