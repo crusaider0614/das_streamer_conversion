@@ -41,7 +41,7 @@ config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_c
 with open(config_file, "rt") as f_read:
     CF = yacs.config.load_cfg(f_read)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda:9")
+device = torch.device("cuda:0")
 tag = CF.TAG
 print("Tag:", tag)
 
