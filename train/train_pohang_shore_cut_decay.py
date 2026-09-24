@@ -1,0 +1,422 @@
+"""train_pohang_shore_cut.py with the learning rate decayed to zero.
+
+A copy rather than a flag, so the run that produced
+`pohang_shore_das_str_cut_iden` stays reproducible from the file that produced
+it.  The only difference is the scheduler.
+
+Why
+---
+The original runs `ExponentialLR(gamma=1.0)`, which is a constant learning
+rate for all 200 epochs.  Scoring its checkpoints showed the two distribution
+distances flat from about epoch 120 - FD 1.4-1.5, FID 34-36 - while the
+physical statistics kept sliding past the streamer they are supposed to reach:
+instantaneous frequency 111.7 Hz at epoch 150 against a target of 111.9, then
+115.9 by 200, and the spectral centroid 133.9 against 130.1, then 138.5.
+
+Distances that stop improving while the statistics keep moving is what a
+two-player game looks like when it is orbiting an equilibrium rather than
+settling into one.  Adversarial training does not descend to a minimum, and at
+a fixed step size the pair generally circles; shrinking the step contracts the
+orbit, and taking it to zero stops the iterate.  That is also why the CycleGAN
+and CUT recipes end with a linear decay to zero and no early stopping - with
+no paired validation loss to select a checkpoint on, the schedule makes the
+last one the answer.
+
+The schedule in those papers is inherited from the pix2pix codebase and before
+that from DCGAN, and neither CycleGAN nor CUT ablates it.  The reason to use it
+here is the measurement above, not the provenance.
+
+LR_DECAY_EPOCHS
+---------------
+How many epochs the decay is spread over, counted from where training starts.
+0 or absent keeps the constant rate, so this file behaves exactly like its
+parent unless the config asks for something else.
+
+Resuming needs one care.  The checkpoint carries the old scheduler's state
+with `last_epoch` at whatever epoch it was saved, and feeding that to a fresh
+LinearLR whose `total_iters` is the decay span would put it straight at the end
+of the schedule - a learning rate of zero from the first step.  So when a decay
+is configured the optimizer state is restored and the scheduler state is not:
+Adam keeps its moments, the schedule starts at full rate.
+
+    python -m train.train_pohang_shore_cut_decay
+"""
+
+import os
+import time
+from itertools import chain
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.optim as optim
+import yacs.config
+from torch.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+from module.dataset_pohang_shore import PohangShoreDataset
+from network.pohang_shore_network_aniso import get_gen_model, get_patch_net, get_dis_model, PatchNCELoss
+from utils.data import get_project_root, ValueTracker
+from utils.parallel import setup, cleanup, run_target
+from utils.pytorch import init_weights
+
+
+def main(config):
+    config_file = os.path.join(get_project_root(), "config", config)
+    with open(config_file, "rt") as f_read:
+        CF = yacs.config.load_cfg(f_read)
+
+    if CF.DEVICE == "cuda":
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(gpu_id) for gpu_id in CF.GPUS])
+
+    world_size = torch.cuda.device_count() if CF.DEVICE == "cuda" else 1
+    run_target(train, world_size, CF)
+
+
+def patch_nce(criterion, query_projected, key_projected, rank):
+    """PatchNCE averaged over the encoder layers the patch net sampled."""
+    loss = torch.zeros((), device=rank, dtype=torch.float32)
+    for feat_q, feat_k in zip(query_projected, key_projected):
+        loss = loss + criterion(feat_q, feat_k)
+    return loss / max(len(query_projected), 1)
+
+
+def train(rank, world_size, CF):
+    setup(rank, world_size, 19467)
+
+    tag = CF.TAG
+    if rank == 0:
+        print("Tag:", tag)
+    cudnn.benchmark = CF.CUDNN_BENCHMARK
+    is_parallel = False
+    if CF.DEVICE == "cpu":
+        device = torch.device("cpu")
+    elif CF.DEVICE == "cuda":
+        if len(CF.GPUS) == 1:
+            device = torch.device("cuda:" + str(CF.GPUS[0]))
+        elif len(CF.GPUS) > 1:
+            is_parallel = True
+            device = torch.device("cuda")
+            torch.cuda.set_device(rank)
+        else:
+            exit(1)
+    else:
+        exit(1)
+
+    if rank == 0:
+        print("Number of GPU:", world_size)
+
+    A_dataset = PohangShoreDataset(
+        is_das=True,
+        crop_size=CF.DATASET.CROP_SIZE,
+        total_length=CF.DATASET.NUM_DATA,
+        is_flip=True,
+        is_negative=True,
+        noise=0.0,
+        is_train=True,
+    )
+    B_dataset = PohangShoreDataset(
+        is_das=False,
+        crop_size=CF.DATASET.CROP_SIZE,
+        total_length=CF.DATASET.NUM_DATA,
+        is_flip=True,
+        is_negative=True,
+        noise=0.0,
+        is_train=True,
+    )
+
+    A_sampler = DistributedSampler(A_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    B_sampler = DistributedSampler(B_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True, seed=71138602)
+
+    A_loader = DataLoader(
+        A_dataset,
+        shuffle=False,
+        batch_size=CF.TRAIN.BATCH_SIZE // world_size,
+        num_workers=2,
+        pin_memory=True,
+        sampler=A_sampler,
+        persistent_workers=True,
+    )
+    B_loader = DataLoader(
+        B_dataset,
+        shuffle=False,
+        batch_size=CF.TRAIN.BATCH_SIZE // world_size,
+        num_workers=2,
+        pin_memory=True,
+        sampler=B_sampler,
+        persistent_workers=True,
+    )
+
+    n_batch = max(len(A_loader), len(B_loader))
+    if rank == 0:
+        print("Length:", len(A_loader), len(B_loader))
+
+    # Train
+    G_A2B = get_gen_model(CF, True).to(rank)
+    PF = get_patch_net(CF).to(rank)
+    D_B = get_dis_model(CF, False).to(rank)
+    if is_parallel:
+        G_A2B = DDP(G_A2B, device_ids=[rank], find_unused_parameters=True)
+        PF = DDP(PF, device_ids=[rank], find_unused_parameters=True)
+        D_B = DDP(D_B, device_ids=[rank], find_unused_parameters=True)
+
+    # Loss.  Standard CUT is adversarial + PatchNCE only; the L1 and the SSIM
+    # that used to be here belonged to the signal/noise decomposition and now
+    # live in train_pohang_shore_cut_decomp.py.
+    nce_criterion = PatchNCELoss().to(rank)
+    value_criterion = nn.L1Loss().to(rank)
+
+    # Optimizer
+    optimizer_G = optim.AdamW(chain(G_A2B.parameters(), PF.parameters()), lr=CF.TRAIN.GEN_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2), weight_decay=1e-4)
+    optimizer_D_B = optim.Adam(D_B.parameters(), lr=CF.TRAIN.DIS_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2))
+
+    # Linear to zero over LR_DECAY_EPOCHS, or the parent's constant rate when
+    # that is 0 or missing.  See the header.
+    decay_epochs = int(CF.TRAIN.get("LR_DECAY_EPOCHS", 0) or 0)
+
+    def make_scheduler(optimizer):
+        if decay_epochs > 0:
+            return optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1.0, end_factor=0.0,
+                total_iters=decay_epochs)
+        return optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.0)
+
+    lr_scheduler_G   = make_scheduler(optimizer_G)
+    lr_scheduler_D_B = make_scheduler(optimizer_D_B)
+    if rank == 0:
+        print("lr schedule: " + (f"linear to zero over {decay_epochs} epochs"
+                                 if decay_epochs > 0 else "constant"))
+
+    idt_losses = []
+    nce_losses = []
+    G_losses = []
+    D_B_losses = []
+    G_B_losses = []
+    if CF.PRETRAIN.LOAD:
+        load_tag = CF.PRETRAIN.TAG
+        state = torch.load(os.path.join(get_project_root(), "checkpoint", load_tag + "_" + str(CF.PRETRAIN.LOAD_EPOCH).zfill(3)), map_location=lambda storage, loc: storage)
+
+        if is_parallel:
+            G_A2B.module.load_state_dict(state["G_A2B"])
+            PF.module.load_state_dict(state["PF"])
+            D_B.module.load_state_dict(state["D_B"])
+        else:
+            G_A2B.load_state_dict(state["G_A2B"])
+            PF.load_state_dict(state["PF"])
+            D_B.load_state_dict(state["D_B"])
+
+        if CF.PRETRAIN.LOAD_OPTIMIZER:
+            optimizer_G.load_state_dict(state["optimizer_G"])
+            optimizer_D_B.load_state_dict(state["optimizer_D_B"])
+
+            # Not the scheduler, when a decay is configured: its saved
+            # `last_epoch` would land a fresh LinearLR at the end of its own
+            # schedule and hold the rate at zero.  See the header.
+            if decay_epochs <= 0:
+                lr_scheduler_G.load_state_dict(state["lr_scheduler_G"])
+                lr_scheduler_D_B.load_state_dict(state["lr_scheduler_D_B"])
+            elif rank == 0:
+                print(f"resumed the optimizers but not the lr schedule; the "
+                      f"decay starts now, at "
+                      f"{lr_scheduler_G.get_last_lr()[0]:g} / "
+                      f"{lr_scheduler_D_B.get_last_lr()[0]:g}")
+
+        idt_losses = state.get("idt_loss", [])
+        nce_losses = state["nce_loss"]
+        G_losses = state["G_loss"]
+        D_B_losses = state["D_B_loss"]
+        G_B_losses = state["G_B_loss"]
+    else:
+        G_A2B.apply(init_weights)
+        PF.apply(init_weights)
+        D_B.apply(init_weights)
+
+    # Training
+    # for param_group in optimizer_D_B.param_groups:
+    #     param_group['lr'] = 5e-6
+    # lr_scheduler_D_B = torch.optim.lr_scheduler.ExponentialLR(optimizer_D_B, gamma=1.0)
+
+    scaler = GradScaler(device="cuda")
+    noise_level = CF.DATASET.NOISE * (CF.DATASET.NOISE_DECAY ** CF.TRAIN.BEGIN_EPOCH)
+    ema_coeff = 0.99
+    avg_idt_nce_loss = ValueTracker(ema_coeff)
+    avg_idt_l1_loss = ValueTracker(ema_coeff)
+    avg_nce_loss = ValueTracker(ema_coeff)
+    avg_G_loss = ValueTracker(ema_coeff)
+    avg_D_B_loss = ValueTracker(ema_coeff)
+    avg_G_B_loss = ValueTracker(ema_coeff)
+    grad_ratio = CF.TRAIN.LAMBDA_ADV
+    for i_epoch in range(CF.TRAIN.BEGIN_EPOCH, CF.TRAIN.END_EPOCH):
+        if rank == 0:
+            lr_G = lr_scheduler_G.get_last_lr()
+            lr_D_B = lr_scheduler_D_B.get_last_lr()
+            print(f"epoch: {i_epoch + 1:4d}, learning rate: {lr_G[0]} {lr_D_B[0]}")
+        start_time = time.time()
+        avg_idt_nce_loss.initialize()
+        avg_idt_l1_loss.initialize()
+        avg_nce_loss.initialize()
+        avg_G_loss.initialize()
+        avg_D_B_loss.initialize()
+        avg_G_B_loss.initialize()
+        for i_iter in range(CF.TRAIN.ITER_PER_EPOCH):
+            epoch_seed = i_epoch * CF.TRAIN.ITER_PER_EPOCH + i_iter
+            A_sampler.set_epoch(epoch_seed)
+            B_sampler.set_epoch(epoch_seed)
+            for i_batch, (real_A_images, real_B_images) in enumerate(zip(A_loader, B_loader)):
+                real_A_images = real_A_images.to(rank, non_blocking=True)
+                real_B_images = real_B_images.to(rank, non_blocking=True)
+
+                # Generator
+                for param in G_A2B.parameters():
+                    param.requires_grad_(True)
+                for param in PF.parameters():
+                    param.requires_grad_(True)
+
+                for param in D_B.parameters():
+                    param.requires_grad_(False)
+
+                with autocast(device_type="cuda"):
+                    # A -> B, and the PatchNCE that ties the output to its own
+                    # input patch by patch
+                    fake_B_images, real_A_features = G_A2B(
+                        real_A_images, extract_features=True, is_check=True)
+                    fake_B_features = G_A2B(fake_B_images, encode_only=True,
+                                            extract_features=True,
+                                            is_check=True)
+                    real_A_projected, patch_ids = PF(real_A_features)
+                    fake_B_projected = PF(fake_B_features,
+                                          patch_ids=patch_ids)
+                    nce_loss = patch_nce(nce_criterion, fake_B_projected,
+                                         real_A_projected, rank)
+
+                    # B -> B.  CUT's idttity term is the SAME PatchNCE run on
+                    # domain B, not an L1: the generator should leave a real B
+                    # alone, and measuring that the same way as the A -> B term
+                    # keeps one loss shape rather than mixing an L1 in.  This
+                    # is lambda_Y in the paper, LAMBDA_I here; set it to 0 for
+                    # the FastCUT variant, which drops this term and the extra
+                    # forward with it.
+                    idt_nce_loss = torch.zeros((), device=rank,
+                                           dtype=torch.float32)
+                    idt_l1_loss = torch.zeros((), device=rank,
+                                           dtype=torch.float32)
+                    if CF.TRAIN.LAMBDA_IDT_NCE > 0 or CF.TRAIN.LAMBDA_IDT_L1 > 0:
+                        same_B_images, real_B_features = G_A2B(
+                            real_B_images, extract_features=True,
+                            is_check=True)
+                        idt_l1_loss = value_criterion(same_B_images, real_B_images)
+
+                        if CF.TRAIN.LAMBDA_IDT_NCE > 0:
+                            same_B_features = G_A2B(same_B_images,
+                                                    encode_only=True,
+                                                    extract_features=True,
+                                                    is_check=True)
+                            real_B_projected, idt_ids = PF(real_B_features)
+                            same_B_projected = PF(same_B_features, patch_ids=idt_ids)
+                            idt_nce_loss = patch_nce(nce_criterion, same_B_projected, real_B_projected, rank)
+
+                    fake_B_logits = D_B(
+                        fake_B_images
+                        + noise_level * torch.randn_like(fake_B_images))
+                    GAN_loss = -fake_B_logits.mean()
+
+                    G_loss = (
+                        CF.TRAIN.LAMBDA_ADV * GAN_loss +
+                        CF.TRAIN.LAMBDA_CONV_NCE * nce_loss +
+                        CF.TRAIN.LAMBDA_IDT_NCE * idt_nce_loss +
+                        CF.TRAIN.LAMBDA_IDT_L1 * idt_l1_loss
+                    )
+
+                avg_idt_nce_loss.feed(idt_nce_loss.detach().item())
+                avg_idt_l1_loss.feed(idt_l1_loss.detach().item())
+                avg_nce_loss.feed(nce_loss.detach().item())
+                avg_G_B_loss.feed(fake_B_logits.detach().mean().item())
+                avg_G_loss.feed(G_loss.detach().item())
+
+                optimizer_G.zero_grad()
+                scaler.scale(G_loss).backward()
+                scaler.step(optimizer_G)
+
+                for param in G_A2B.parameters():
+                    param.requires_grad_(False)
+                for param in PF.parameters():
+                    param.requires_grad_(False)
+
+                for param in D_B.parameters():
+                    param.requires_grad_(True)
+
+                # Discriminator Losses
+                with torch.no_grad():
+                    real_B_noisy = real_B_images + noise_level * torch.randn_like(real_B_images)
+                    fake_B_noisy = fake_B_images + noise_level * torch.randn_like(fake_B_images)
+
+                with autocast(device_type="cuda"):
+                    real_B_logits = D_B(real_B_noisy.detach())
+                    fake_B_logits = D_B(fake_B_noisy.detach())
+
+                    # D_B_loss = adversarial_criterion(fake_B_logits, fake_labels) + adversarial_criterion(real_B_logits, real_labels)
+                    D_B_loss = nn.ReLU()(1.0 + fake_B_logits).mean() + nn.ReLU()(1.0 - real_B_logits).mean()
+
+                avg_D_B_loss.feed(real_B_logits.detach().mean().item())
+
+                optimizer_D_B.zero_grad()
+                scaler.scale(D_B_loss).backward()
+                scaler.step(optimizer_D_B)
+
+                scaler.update()
+
+                if rank == 0 and ((i_batch + 1) % 10 == 0 or (i_batch + 1) == n_batch):
+                    print("epoch: {:4}, batch: {:4}, idt_nce: {:8.2e}, idt_l1: {:8.2e}, nce_loss: {:8.2e}, G_loss: {:9.2e}, B_score: {:7.4f}, {:7.4f}".format(
+                        i_epoch + 1,
+                        i_batch + 1,
+                        avg_idt_nce_loss.val(),
+                        avg_idt_l1_loss.val(),
+                        avg_nce_loss.val(),
+                        avg_G_loss.val(),
+                        avg_D_B_loss.val(),
+                        avg_G_B_loss.val(),
+                    ))
+
+        lr_scheduler_G.step()
+        lr_scheduler_D_B.step()
+        noise_level *= CF.DATASET.NOISE_DECAY
+
+        if rank == 0:
+            if True:
+                idt_losses.append(avg_idt_nce_loss.val())
+                nce_losses.append(avg_nce_loss.val())
+                G_losses.append(avg_G_loss.val())
+                D_B_losses.append(avg_D_B_loss.val())
+                G_B_losses.append(avg_G_B_loss.val())
+
+                state = {
+                    "G_A2B": G_A2B.module.state_dict() if is_parallel else G_A2B.state_dict(),
+                    "PF": PF.module.state_dict() if is_parallel else PF.state_dict(),
+                    "D_B": D_B.module.state_dict() if is_parallel else D_B.state_dict(),
+                    "optimizer_G": optimizer_G.state_dict(),
+                    "optimizer_D_B": optimizer_D_B.state_dict(),
+                    "lr_scheduler_G": lr_scheduler_G.state_dict(),
+                    "lr_scheduler_D_B": lr_scheduler_D_B.state_dict(),
+                    "idt_loss": idt_losses,
+                    "nce_loss": nce_losses,
+                    "G_loss": G_losses,
+                    "D_B_loss": D_B_losses,
+                    "G_B_loss": G_B_losses,
+                }
+
+                print("epoch: {:4}, save training state".format(i_epoch + 1))
+                torch.save(state, os.path.join(get_project_root(), "checkpoint", tag + "_" + str(i_epoch + 1).zfill(3)))
+                if i_epoch % CF.TRAIN.CHECK_EPOCH != 0:
+                    os.system("rm " + os.path.join(get_project_root(), "checkpoint", tag + "_" + str(i_epoch).zfill(3)))
+
+            print("epoch: {:4}, execution time: {:6.2f}".format(
+                i_epoch + 1,
+                time.time() - start_time,
+            ))
+
+    cleanup()
+
+if __name__ == "__main__":
+    main("pohang_shore_das_str_cut_decay.yaml")

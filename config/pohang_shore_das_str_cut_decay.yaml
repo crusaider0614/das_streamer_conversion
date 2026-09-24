@@ -1,0 +1,70 @@
+# The winning CUT run, resumed at epoch 150 with the learning rate taken to
+# zero.  Used by `python -m train.train_pohang_shore_cut_decay`.
+#
+# Everything below is copied from pohang_shore_das_str_cut.yaml unchanged
+# except the five keys under the two markers, because one experiment moves one
+# thing.  Scoring the parent run showed FD and FID flat from about epoch 120
+# while the instantaneous frequency drifted 111.7 -> 115.9 Hz past a target of
+# 111.9 and the centroid 133.9 -> 138.5 past 130.1; the question here is
+# whether that drift is the fixed learning rate.  The train script's header
+# has the reasoning.
+#
+# 150 is where the parent is best: FD 1.41, its lowest, and a frequency
+# essentially on target.  Resuming there asks whether there is anything left
+# below that plateau rather than starting the whole search again.
+TAG: "pohang_shore_das_str_cut_iden_decay"
+CUDNN_BENCHMARK: True
+SEED: 19467
+DEVICE: "cuda"
+GPUS: [ 4, 5, 6, 7 ]
+
+# ---- changed: resume from the parent's epoch 150 --------------------------
+PRETRAIN:
+  LOAD: True
+  TAG: "pohang_shore_das_str_cut_iden"
+  LOAD_EPOCH: 150
+  # Adam's moments carry over; the lr schedule deliberately does not.  See the
+  # train script's header for why restoring it would pin the rate at zero.
+  LOAD_OPTIMIZER: True
+
+DATASET:
+  CROP_SIZE: [ 2000, 128 ]
+  NUM_DATA: 4000
+  NOISE: 0.01
+  NOISE_DECAY: 1.0
+
+MODEL:
+  A_CHANNELS: 1        # DAS
+  B_CHANNELS: 1        # streamer
+  OUT_CHANNELS: 1
+  GEN_CHANNELS: 64
+  GEN_NORM: True
+  GEN_SPEC: False
+  GEN_CBAM: True
+  DIS_CHANNELS: 64
+  DIS_NORM: False
+  DIS_SPEC: True
+  DIS_CBAM: True
+
+TRAIN:
+  BATCH_SIZE: 16
+  ITER_PER_EPOCH: 1
+  # ---- changed: 50 more epochs, checkpointed twice as often ---------------
+  BEGIN_EPOCH: 150
+  END_EPOCH: 200
+  # 5 rather than 10, so 50 epochs still give ten checkpoints to score.
+  CHECK_EPOCH: 5
+  # ---- changed: the experiment --------------------------------------------
+  # Linear from the rates below to zero across all 50 epochs.  0 or absent
+  # would make this file behave exactly like its parent.
+  LR_DECAY_EPOCHS: 50
+  # --------------------------------------------------------------------------
+  GEN_LR: 0.0001
+  DIS_LR: 0.00005
+  BETA1: 0.5
+  BETA2: 0.999
+  LAMBDA_IDT_NCE: 0.5       # identity loss
+  LAMBDA_IDT_L1: 1.0
+  LAMBDA_ADV: 1.0           # adversarial loss
+  LAMBDA_CONV_NCE: 0.5      # PatchNCE loss
+  LAMBDA_SSIM: 1.0
