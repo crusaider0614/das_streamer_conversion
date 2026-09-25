@@ -34,10 +34,10 @@ def show_four(panels, names=("real A", "fake B", "real B", "same B"), clip=1.0):
     plt.show()
 
 
-epoch = 150
+epoch = 200
 
 # Define
-config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut.yaml")
+config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut_decay.yaml")
 with open(config_file, "rt") as f_read:
     CF = yacs.config.load_cfg(f_read)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
