@@ -712,8 +712,11 @@ def get_gen_model(cfg, from_a, additional_channel=0, **kwargs):
 
 
 def get_patch_net(cfg, **kwargs):
-    # kwargs reaches PatchSampleF.  It used to be accepted and dropped, so
-    # `get_patch_net(CF, num_patches=512)` silently built a 256-patch net.
+    # NUM_PATCHES drives PatchNCE's sample count; an explicit kwarg still wins,
+    # and a config without the key keeps the old default.  kwargs used to be
+    # accepted and dropped here, so `get_patch_net(CF, num_patches=512)`
+    # silently built a 256-patch net.
+    kwargs.setdefault("num_patches", cfg.MODEL.get("NUM_PATCHES", 256))
     model = PatchSampleF(
         cfg.MODEL.GEN_CHANNELS,
         **kwargs,

@@ -1,6 +1,3 @@
-# One-way (DAS -> streamer) variant.  Used by
-# `python -m train.train_pohang_shore_oneway` and by
-# `python -m inference.test_pohang_shore`.
 TAG: "pohang_shore_das_str_oneway"
 CUDNN_BENCHMARK: True
 SEED: 19467
@@ -20,8 +17,9 @@ DATASET:
   NOISE_DECAY: 0.98
 
 MODEL:
-  A_CHANNELS: 1        # DAS
-  B_CHANNELS: 1        # streamer
+  A_CHANNELS: 1
+  B_CHANNELS: 1
+  NUM_PATCHES: 512
   GEN_CHANNELS: 32
   GEN_NORM: True
   GEN_SPEC: False
