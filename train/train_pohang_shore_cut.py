@@ -111,7 +111,7 @@ def train(rank, world_size, CF):
 
     # Train
     G_A2B = get_gen_model(CF, True).to(rank)
-    PF = get_patch_net(CF).to(rank)
+    PF = get_patch_net(CF, num_patches=512).to(rank)
     D_B = get_dis_model(CF, False).to(rank)
     if is_parallel:
         G_A2B = DDP(G_A2B, device_ids=[rank], find_unused_parameters=True)

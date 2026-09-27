@@ -187,7 +187,7 @@ from utils.process import envelope_1d
 
 # Checkpoint tag, and which epochs to score.  None scans the directory for
 # every `<TAG>_<digits>` it holds and sorts them.
-TAG = "pohang_shore_das_str_cut_iden"
+TAG = "pohang_shore_das_str_cut_iden_2"
 EPOCHS = None
 
 # Which DAS receivers to score.  "all" is the whole 264-channel line, the two
@@ -295,7 +295,7 @@ CSV_DIR = "checkpoint"
 # training config names GPUS [4, 5, 6, 7] and the older test script hard-codes
 # cuda:9.  So the index is written out.  None runs on the CPU, which works
 # but is slow: the FID's Inception dominates everything there.
-GPU = 0
+GPU = 4
 DEVICE = (f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available()
           else "cpu")
 
