@@ -458,9 +458,35 @@ class UNetGenerator(nn.Module):
 
 
 class PatchSampleF(nn.Module):
-    def __init__(self, base_channels, out_channels=256, num_patches=256):
+    """Projects `num_patches` sampled locations of each encoder layer.
+
+    `live_mask` keeps the sampling out of the mute.  PatchNCE asks which of
+    the sampled locations is the matching one, and the muted top of the record
+    is identically zero, so every feature inside it is the same vector and the
+    question has no answer there.  A group of m identical queries cannot score
+    better than log(m) each, which at the measured 28.5 % mute of the DAS
+    record puts a floor of about 1.22 on a 256-patch loss and 1.42 on a
+    512-patch one - a constant the loss can never work off, and gradients that
+    push the encoder to separate things that are genuinely identical.
+
+    The mask is at input resolution; each layer gets it pooled down to its own
+    grid and a cell is taken as live when at least `live_frac` of the input
+    pixels under it are.  That is the cell, not the receptive field, which
+    reaches further; a feature whose cell is live can still see some mute.
+    Tightening `live_frac` does not fix that - only sampling further from the
+    boundary would - but it is the cheap approximation and it removes the
+    identical-query problem, which is the part that has a floor.
+
+    Sampling becomes per batch element, since the mute reaches a different
+    depth in every gather (172 to 1347 samples on one receiver).  One shared
+    index list would have to be live in all of them at once.
+    """
+
+    def __init__(self, base_channels, out_channels=256, num_patches=256,
+                 live_frac=1.0):
         super().__init__()
         self.num_patches = num_patches
+        self.live_frac = live_frac
 
         self.channels_list = [
             1 * base_channels,
@@ -478,7 +504,37 @@ class PatchSampleF(nn.Module):
             )
             self.mlps.append(mlp)
 
-    def forward(self, features, patch_ids=None):
+    def live_ids(self, B, H, W, live_mask, device):
+        """(B, num_patches) indices into a flattened H x W grid, off the mute.
+
+        A gather with fewer live cells than patches asked for takes all of
+        them and then repeats some, which is better than reaching into the
+        mute: a repeat is at least a query whose positive is distinguishable
+        from most of the field, where a muted one is distinguishable from
+        nothing.  A gather with no live cell at all - which the dataset's
+        MIN_LIVE should already prevent - falls back to sampling anywhere.
+        """
+        # Pool the DEAD pixels, not the live ones.  Under autocast the mean of
+        # sixteen ones comes back as 0.99951 in half precision and a fully
+        # live cell fails a `>= 1.0` test; the mean of zeros is exactly zero
+        # in any precision, so this way round the strict case is exact.
+        dead = F.adaptive_avg_pool2d((~live_mask).to(torch.float32), (H, W))
+        live = (dead <= 1.0 - self.live_frac).view(B, -1)
+
+        ids = torch.empty(B, self.num_patches, dtype=torch.long, device=device)
+        for b in range(B):
+            idx = torch.nonzero(live[b], as_tuple=False).squeeze(1)
+            n = idx.numel()
+            if n == 0:
+                ids[b] = torch.randperm(H * W, device=device)[:self.num_patches]
+            elif n >= self.num_patches:
+                ids[b] = idx[torch.randperm(n, device=device)[:self.num_patches]]
+            else:
+                extra = torch.randint(n, (self.num_patches - n,), device=device)
+                ids[b] = torch.cat([idx, idx[extra]])
+        return ids
+
+    def forward(self, features, patch_ids=None, live_mask=None):
         return_ids = []
         result = []
 
@@ -489,11 +545,20 @@ class PatchSampleF(nn.Module):
 
             if patch_ids is not None:
                 patch_id = patch_ids[i]
-            else:
+            elif live_mask is None:
                 patch_id = torch.randperm(feat_reshape.shape[1], device=feat.device)[:self.num_patches]
                 return_ids.append(patch_id)
+            else:
+                patch_id = self.live_ids(B, H, W, live_mask, feat.device)
+                return_ids.append(patch_id)
 
-            x_sample = feat_reshape[:, patch_id, :]
+            if patch_id.dim() == 1:
+                # one index list for the whole batch, the original behaviour
+                x_sample = feat_reshape[:, patch_id, :]
+            else:
+                x_sample = torch.gather(
+                    feat_reshape, 1,
+                    patch_id.unsqueeze(-1).expand(-1, -1, feat_reshape.size(-1)))
             x_proj = mlp(x_sample)
             result.append(x_proj)
 
@@ -647,8 +712,11 @@ def get_gen_model(cfg, from_a, additional_channel=0, **kwargs):
 
 
 def get_patch_net(cfg, **kwargs):
+    # kwargs reaches PatchSampleF.  It used to be accepted and dropped, so
+    # `get_patch_net(CF, num_patches=512)` silently built a 256-patch net.
     model = PatchSampleF(
         cfg.MODEL.GEN_CHANNELS,
+        **kwargs,
     )
     # load the pre-trained model
     if "PRETRAINED" in cfg.MODEL.keys() and os.path.exists(cfg.MODEL.PRETRAINED) and os.path.isfile(cfg.MODEL.PRETRAINED):

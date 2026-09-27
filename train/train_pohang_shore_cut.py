@@ -218,7 +218,12 @@ def train(rank, world_size, CF):
                     fake_B_features = G_A2B(fake_B_images, encode_only=True,
                                             extract_features=True,
                                             is_check=True)
-                    real_A_projected, patch_ids = PF(real_A_features)
+                    # The mute is exactly zero - the dataset adds no noise -
+                    # so it doubles as the mask that keeps PatchNCE from
+                    # sampling there.  See PatchSampleF for why sampling in
+                    # the mute puts a floor under the loss.
+                    real_A_projected, patch_ids = PF(
+                        real_A_features, live_mask=(real_A_images != 0))
                     fake_B_projected = PF(fake_B_features,
                                           patch_ids=patch_ids)
                     nce_loss = patch_nce(nce_criterion, fake_B_projected,
@@ -246,7 +251,9 @@ def train(rank, world_size, CF):
                                                     encode_only=True,
                                                     extract_features=True,
                                                     is_check=True)
-                            real_B_projected, idt_ids = PF(real_B_features)
+                            real_B_projected, idt_ids = PF(
+                                real_B_features,
+                                live_mask=(real_B_images != 0))
                             same_B_projected = PF(same_B_features, patch_ids=idt_ids)
                             idt_nce_loss = patch_nce(nce_criterion, same_B_projected, real_B_projected, rank)
 
