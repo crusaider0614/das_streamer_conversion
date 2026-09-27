@@ -128,8 +128,33 @@ def train(rank, world_size, CF):
     optimizer_G = optim.AdamW(chain(G_A2B.parameters(), PF.parameters()), lr=CF.TRAIN.GEN_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2), weight_decay=1e-4)
     optimizer_D_B = optim.Adam(D_B.parameters(), lr=CF.TRAIN.DIS_LR, betas=(CF.TRAIN.BETA1, CF.TRAIN.BETA2))
 
-    lr_scheduler_G   = optim.lr_scheduler.ExponentialLR(optimizer_G,   gamma=1.0)
-    lr_scheduler_D_B = optim.lr_scheduler.ExponentialLR(optimizer_D_B, gamma=1.0)
+    # TRAIN.LR_DECAY_EPOCHS is the number of epochs at the END of the run over
+    # which the rate falls linearly to zero; before that it is constant.  That
+    # is the pix2pix / CycleGAN / CUT shape, and 0 or a missing key keeps the
+    # constant rate this file used to have.
+    #
+    # The factor is computed from the absolute epoch rather than accumulated,
+    # so a resumed run lands where the schedule says it should.
+    decay_epochs = int(CF.TRAIN.get("LR_DECAY_EPOCHS", 0) or 0)
+    decay_start = CF.TRAIN.END_EPOCH - decay_epochs
+
+    def lr_factor(step):
+        epoch = CF.TRAIN.BEGIN_EPOCH + step
+        if epoch < decay_start:
+            return 1.0
+        return max(0.0, (CF.TRAIN.END_EPOCH - epoch) / float(decay_epochs))
+
+    def make_scheduler(optimizer):
+        if decay_epochs > 0:
+            return optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+        return optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.0)
+
+    lr_scheduler_G   = make_scheduler(optimizer_G)
+    lr_scheduler_D_B = make_scheduler(optimizer_D_B)
+    if rank == 0:
+        print("lr schedule: " + (
+            f"constant to epoch {decay_start}, then linear to zero by "
+            f"{CF.TRAIN.END_EPOCH}" if decay_epochs > 0 else "constant"))
 
     idt_losses = []
     nce_losses = []
@@ -153,8 +178,17 @@ def train(rank, world_size, CF):
             optimizer_G.load_state_dict(state["optimizer_G"])
             optimizer_D_B.load_state_dict(state["optimizer_D_B"])
 
-            lr_scheduler_G.load_state_dict(state["lr_scheduler_G"])
-            lr_scheduler_D_B.load_state_dict(state["lr_scheduler_D_B"])
+            # Not the scheduler when a decay is configured.  The saved state
+            # carries the old scheduler's `last_epoch`, and restoring it into
+            # a fresh schedule desynchronises the two; the factor here is a
+            # function of the absolute epoch, so starting it clean is right.
+            if decay_epochs <= 0:
+                lr_scheduler_G.load_state_dict(state["lr_scheduler_G"])
+                lr_scheduler_D_B.load_state_dict(state["lr_scheduler_D_B"])
+            elif rank == 0:
+                print(f"resumed the optimizers but not the lr schedule; "
+                      f"starting at {lr_scheduler_G.get_last_lr()[0]:g} / "
+                      f"{lr_scheduler_D_B.get_last_lr()[0]:g}")
 
         idt_losses = state.get("idt_loss", [])
         nce_losses = state["nce_loss"]
