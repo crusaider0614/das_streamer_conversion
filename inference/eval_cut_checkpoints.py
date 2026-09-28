@@ -216,6 +216,13 @@ from utils.process import envelope_1d
 TAG = "pohang_shore_das_str_cut_iden_2"
 EPOCHS = None
 
+# The earliest epoch to score, applied after EPOCHS.  None scores every
+# checkpoint there is, which is what this did before the setting existed, and
+# 0 is the same thing.  A number skips anything earlier - for picking up where
+# a scored run left off, or for dropping the early epochs of a long one, at
+# roughly two minutes of generator and metrics per checkpoint.
+FROM_EPOCH = None
+
 # Which DAS receivers to score.  "all" is the whole 264-channel line, the two
 # arrays stacked back into receiver order, which is what the model is actually
 # run on and the only setting where both offset bins are populated.
@@ -335,13 +342,16 @@ def resolve(path):
 def find_checkpoints():
     d = resolve("checkpoint")
     if EPOCHS is not None:
-        return [(e, os.path.join(d, f"{TAG}_{e:03d}")) for e in EPOCHS]
-    pat = re.compile(re.escape(TAG) + r"_(\d+)$")
-    out = []
-    for name in os.listdir(d):
-        m = pat.match(name)
-        if m:
-            out.append((int(m.group(1)), os.path.join(d, name)))
+        out = [(e, os.path.join(d, f"{TAG}_{e:03d}")) for e in EPOCHS]
+    else:
+        pat = re.compile(re.escape(TAG) + r"_(\d+)$")
+        out = []
+        for name in os.listdir(d):
+            m = pat.match(name)
+            if m:
+                out.append((int(m.group(1)), os.path.join(d, name)))
+    if FROM_EPOCH is not None:
+        out = [e for e in out if e[0] >= FROM_EPOCH]
     return sorted(out)
 
 
@@ -942,8 +952,10 @@ def fmt(v, w, p, suffix=""):
 def main():
     ck = find_checkpoints()
     if not ck:
-        raise SystemExit(f"no checkpoints named {TAG}_<epoch> under "
-                         f"{resolve('checkpoint')}")
+        raise SystemExit(
+            f"no checkpoints named {TAG}_<epoch> under "
+            f"{resolve('checkpoint')}"
+            + ("" if FROM_EPOCH is None else f" at epoch {FROM_EPOCH} or later"))
 
     global OFFSET_SPLIT_M
     if OFFSET_SPLIT_M is None:
