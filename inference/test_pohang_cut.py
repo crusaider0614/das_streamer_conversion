@@ -34,7 +34,7 @@ def show_four(panels, names=("real A", "fake B", "real B", "same B"), clip=1.0):
     plt.show()
 
 
-epoch = 80
+epoch = 120
 
 # Define
 config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut.yaml")
