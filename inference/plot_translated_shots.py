@@ -1,44 +1,51 @@
-"""Shot gathers before and after translation, both in true-amplitude units.
+"""Shot gathers before and after translation, in either amplitude domain.
 
-    left   das_data_norm.npy      the DAS as it was before the envelope gain
-    right  das_data_fake_str.npy  with that gain taken back off
+    left   das_data_rg_{train,infer}.npy   the generator's own input
+    right  das_data_fake_str.npy           its output
 
-Copied from process/plot_shots.py.  The difference is what each panel holds:
-that script draws whatever is in the file, and the translated file is in the
-log-envelope domain, where a gain that varies down the trace has flattened the
-amplitude decay.  Reading a translation there is misleading - the gain hides
-exactly the amplitude behaviour the translation is supposed to change - so
-this one undoes the gain first and shows both sides on the amplitude scale the
-data really has.
+Copied from process/plot_shots.py.  The difference is what each panel holds
+and which amplitude domain they are shown in.
 
-The inversion
--------------
-`utils.process.calculate_norscale_inversion` is the gain's own inverse: it
-does not know the scale that was applied, it re-estimates it from the scaled
-data and divides it back out, fifty times, until the estimate stops moving.
+The input side
+--------------
+Assembled from the two receiver-major arrays the generator was actually given
+and put back into receiver order, one strided read per shot, rather than read
+from a shot-major file.  das_data_norm.npy would be the wrong thing to
+compare against twice over: it is in recording order where the translated
+file is sorted along the line, so shot i is not the same shot, and it never
+had the envelope gain applied, so it is not what the model saw.
 
-It is run with the STREAMER parameters, C.LOG_SCALE_PARAMS["str"], because
-that is the domain the translated file is in - inference/translate_das.py
-brings the generator's output back through the streamer's `value_range`, and
-the generator was trained against streamer gathers that carried the streamer's
-gain.  Using the DAS parameters here would undo a gain that was never applied.
+DOMAIN
+------
+    "log"     both panels exactly as they are stored, in the log-envelope
+              domain the generator works in.  Nothing is estimated, so this
+              is the honest view of what the model produced.
+    "normal"  the envelope gain taken off both sides, which is the domain the
+              data really has.  The gain flattens the amplitude decay, so
+              reading a translation in "log" hides the amplitude behaviour
+              the translation is supposed to change.
 
-The front pad matters.  process/logenv_process.py computed the forward gain on
-a gather with PAD_FRONT zeros in front of it, which pins
+The gain is undone with `utils.process.calculate_norscale_inversion`, which
+re-estimates the scale from the scaled data and divides it back out.  Each
+side is inverted with ITS OWN parameters - the input carries the DAS gain,
+the output the streamer's, since translate_das.py brings the generator's
+output back through the streamer's `value_range` and the generator was
+trained against streamer gathers.  Both then sit at the TARGET_RMS that
+rms_normalize.py set before the gain, so the panels can be read against each
+other.
+
+The front pad matters.  process/logenv_process.py computed the forward gain
+on a gather with PAD_FRONT zeros in front of it, which pins
 `calculate_logscale`'s `data_env_log.min()` to log10(log_base) whatever the
-gather contains; without it that minimum floats with the gather and the
-estimate comes back systematically different.  So the same pad goes on here
-and is cropped off afterwards.
-
-Both sides end up on the same footing: process/rms_normalize.py put each
-domain at TARGET_RMS = 0.1 before the gain, so the two panels can be read
-against each other rather than only against themselves.
+gather contains; without it that minimum floats and the estimate comes back
+systematically different.  So the same pad goes on here and is cropped off
+afterwards.
 
 Shot order
 ----------
-das_data_fake_str.npy has its shots SORTED along the line; das_data_norm.npy
-is in RECORDING order.  Shot i is not the same shot in the two files, so the
-DAS side is reordered by process.shot_geometry before anything is drawn.
+Both sides are in the sorted order the rg arrays and the translated file
+share, so shot i is the same shot in both.  The title also gives the
+recording index.
 
 Edit the settings block below, then run from the repository root:
 
@@ -53,15 +60,16 @@ import numpy as np
 
 import config as C
 import process.shot_geometry as G
+from process.plot_shots import RGShots
 from utils.data import get_project_root
 from utils.process import calculate_norscale_inversion
 
 # ---------------------------------------------------------------- settings --
 
-# The translated file, and the DAS before the envelope gain.  Relative paths
-# resolve against the project root, not the working directory.
+# The translated file.  A relative path resolves against the project root,
+# not the working directory.  The input side is assembled from
+# C.ARRAYS["das"]["rg_train"] and ["rg_infer"] - see the header.
 FAKE_NPY = C.ARRAYS["das"]["fake_str"]
-DAS_NPY = C.ARRAYS["das"]["norm"]
 
 # Which shots: every STEP-th from START up to STOP (STOP = None -> the end).
 # Indices are into the TRANSLATED file, so they are sorted-order indices.
@@ -69,21 +77,25 @@ STEP = 50
 START = 0
 STOP = None
 
-# Whose gain to undo, and how hard to look for it.  "str" - see the header.
+# "log" draws both sides as stored; "normal" takes the envelope gain off
+# both.  See the header.
+DOMAIN = "normal"
+
+# Whose gain each side carries.  The input is DAS, the output is the streamer
+# it was translated into.
+IN_LOG_TAG = "das"
+OUT_LOG_TAG = "str"
+
 # 50 is calculate_norscale_inversion's own default and costs 5.7 s for a
-# 264-trace gather.  Measured against a gather whose gain was applied and then
-# taken back off, the error relative to the gather's peak is 2.3e-3 mean after
-# 5 iterations, 6.1e-5 after 20 and 3.6e-7 after 50, so 20 is plenty if the
-# wait is annoying.
-LOG_TAG = "str"
+# 264-trace gather, so a two-panel figure is about twelve seconds.  Measured
+# against a gather whose gain was applied and then taken back off, the error
+# relative to the gather's peak is 2.3e-3 mean after 5 iterations, 6.1e-5
+# after 20 and 3.6e-7 after 50, so 20 is plenty if the wait is annoying.
 ITERATIONS = 50
 
 # Zeros in front of the gather while the gain is estimated, in samples.  Must
 # match process/logenv_process.PAD_FRONT - see the header.
 PAD_FRONT = 2000
-
-# Set False to draw the translated file as it is, still carrying the gain.
-INVERT_ENV = True
 
 DT_MS = 1.0
 
@@ -117,14 +129,14 @@ def open_array(path, name):
     return a
 
 
-def invert_env(gather):
-    """Take the envelope gain back off one shot gather.
+def invert_env(gather, tag):
+    """Take the `tag` envelope gain back off one shot gather.
 
     The pad is zeros, so it survives the division unchanged and keeps
     `data_env_log.min()` pinned where the forward pass had it; it is cropped
     off before the result is returned.
     """
-    lsp = dict(C.LOG_SCALE_PARAMS[LOG_TAG])
+    lsp = dict(C.LOG_SCALE_PARAMS[tag])
     g = np.asarray(gather, dtype=np.float64)
     if PAD_FRONT:
         g = np.concatenate([np.zeros((PAD_FRONT, g.shape[1])), g], axis=0)
@@ -147,11 +159,14 @@ def draw(ax, gather, clip=None):
 
 
 def main():
+    if DOMAIN not in ("log", "normal"):
+        raise SystemExit(f"DOMAIN {DOMAIN!r} is not 'log' or 'normal'")
+
     fake = open_array(FAKE_NPY, "translated")
-    das = open_array(DAS_NPY, "DAS before the gain")
-    if fake.shape != das.shape:
-        raise SystemExit(f"translated {fake.shape} against DAS {das.shape}; "
-                         f"they have to be the same grid")
+    das = RGShots()                     # the generator's own input, assembled
+    if tuple(fake.shape) != tuple(das.shape):
+        raise SystemExit(f"translated {fake.shape} against the rg arrays "
+                         f"{das.shape}; they have to be the same grid")
 
     n_shots, n_t, n_ch = fake.shape
     order = np.asarray(G.sorted_order()["orig_idx"], dtype=int)
@@ -162,13 +177,17 @@ def main():
     print(f"{resolve(FAKE_NPY)}")
     print(f"  {n_shots} shots x {n_t} samples @ {DT_MS:g} ms x {n_ch} "
           f"channels  ({fake.dtype})")
-    print(f"  against {os.path.basename(resolve(DAS_NPY))}, reordered from "
-          f"recording to sorted")
-    if INVERT_ENV:
-        lsp = C.LOG_SCALE_PARAMS[LOG_TAG]
-        print(f"  undoing the {LOG_TAG} envelope gain: log_base "
-              f"{lsp['log_base']:g}, sigma {lsp['smooth_sigma']}, "
-              f"{ITERATIONS} iterations, {PAD_FRONT}-sample front pad")
+    print(f"  against rg_train + rg_infer, {len(das.inside)} + "
+          f"{len(das.outside)} receivers put back in order; both sides are "
+          f"in sorted shot order")
+    if DOMAIN == "normal":
+        for tag in (IN_LOG_TAG, OUT_LOG_TAG):
+            lsp = C.LOG_SCALE_PARAMS[tag]
+            print(f"  undoing the {tag} envelope gain: log_base "
+                  f"{lsp['log_base']:g}, sigma {lsp['smooth_sigma']}, "
+                  f"{ITERATIONS} iterations, {PAD_FRONT}-sample front pad")
+    else:
+        print(f"  log-envelope domain, both sides as stored")
 
     stop = n_shots if STOP is None else min(STOP, n_shots)
     indices = list(range(START, stop, STEP))
@@ -177,12 +196,14 @@ def main():
     print(f"  plotting {len(indices)} shots: {indices[0]} .. {indices[-1]} "
           f"every {STEP}")
 
+    titles = (f"input DAS, {DOMAIN}", f"translated, {DOMAIN}")
     for idx in indices:
         t0 = time.time()
-        before = np.asarray(das[order[idx]], dtype=np.float64)
+        before = np.asarray(das[idx], dtype=np.float64)
         after = np.asarray(fake[idx], dtype=np.float64)
-        if INVERT_ENV:
-            after = invert_env(after)
+        if DOMAIN == "normal":
+            before = invert_env(before, IN_LOG_TAG)
+            after = invert_env(after, OUT_LOG_TAG)
 
         clip = None
         if SHARED_CLIP:
@@ -192,14 +213,9 @@ def main():
         # one moves the other and the same samples stay opposite each other
         fig, axes = plt.subplots(1, 2, figsize=(9, 7),
                                  sharex=True, sharey=True)
-        v0 = draw(axes[0], before, clip)
-        v1 = draw(axes[1], after, clip)
-        axes[0].set_title(f"DAS, before the gain\nclip +-{v0:.4g}", fontsize=9)
-        axes[1].set_title(f"translated, gain removed\nclip +-{v1:.4g}"
-                          if INVERT_ENV else
-                          f"translated, log envelope\nclip +-{v1:.4g}",
-                          fontsize=9)
-        for ax in axes:
+        for ax, img, name in zip(axes, (before, after), titles):
+            v = draw(ax, img, clip)
+            ax.set_title(f"{name}\nclip +-{v:.4g}", fontsize=9)
             ax.set_xlabel("channel")
         axes[0].set_ylabel("time [s]")
         fig.suptitle(f"sorted shot {idx}  (recording {order[idx]})",
@@ -207,7 +223,7 @@ def main():
         fig.tight_layout()
 
         print(f"shot {idx:4d} (rec {order[idx]:4d}): "
-              f"das [{before.min():.4g}, {before.max():.4g}]  "
+              f"input [{before.min():.4g}, {before.max():.4g}]  "
               f"translated [{after.min():.4g}, {after.max():.4g}]  "
               f"{time.time() - t0:.1f}s")
 
