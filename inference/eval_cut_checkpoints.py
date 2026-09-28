@@ -57,9 +57,35 @@ distributions and positions instead.
      Did events move?  Envelopes rather than waveforms, so a legitimate change
      of waveform leaves the lag alone and only a real displacement shows.
      Validated by shifting a gather a known (7 ms, 3 traces): recovered exactly,
-     peak correlation 0.93.  Both axes are reported - there is no mechanism
-     that should move anything sideways, so dx is the control.
-         target  (0, 0)
+     peak correlation 0.93.
+
+     Reported as the tail, not the middle.  The medians of dt and dx read 0.0
+     in every run that was not already broken, and they had to: the lag is a
+     whole number of samples and traces, so half the sub-windows would have to
+     move before a median leaves zero, and a run with 1 % of its windows past
+     2 ms still printed 0.0.  So:
+
+         p99|dt|   the 99th percentile of |dt| in ms.  Target 0.  It sees a
+                   tail once that tail is bigger than 1 % and not before:
+                   with exactly 1 % of sub-windows at 10 ms it interpolates
+                   across the boundary and reads 0.1, where |dt|<=2 reads
+                   99.00 % and says plainly what happened.  Read the two
+                   together - the share says how much of the record moved,
+                   the percentile says how far.
+         dx=0      the share of sub-windows with no trace-axis shift at all.
+                   There is no mechanism that should move anything sideways,
+                   so this is the control and the target is 100 %.  A band
+                   like the one below would not suit it - dx is searched over
+                   +-4 traces, so "within 2" would pass half the range.
+         |dt|<=2   the share inside 2 ms, which is 40 degrees of phase at the
+                   110 Hz the streamer sits at.  Target 100 %.
+         peak      the correlation at the chosen lag, median over sub-windows.
+                   Not a score - 1.000 would mean the envelope did not change
+                   at all.  It says how much the translation moved, and it is
+                   what says whether the lag above is a real peak or noise.
+
+     Both shares print to two decimals: the difference between 100.00 and
+     99.43 is the whole signal, and at zero decimals they look the same.
 
 The table opens with two rows that are not checkpoints:
 
@@ -763,6 +789,19 @@ def nanavg(v):
     return float(np.mean(v)) if v.size else np.nan
 
 
+def nanquant(v, q):
+    """The q-th quantile of |v|, which is where the tail of a lag lives."""
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    return float(np.quantile(np.abs(v), q)) if v.size else np.nan
+
+
+def nanfrac(v, pred):
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    return float(np.mean(pred(v))) if v.size else np.nan
+
+
 class Split:
     """Per-trace (or per-sub-window) values kept apart by offset bin."""
 
@@ -882,9 +921,14 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
             env=nanavg(ec.get(b)),
             if_med=nanmed(fq.get(b)),
             centroid=nanmed(ct.get(b)),
-            dt=nanmed(d),
-            dx=nanmed(dx_.get(b)),
-            dt_within2=float(np.mean(np.abs(d) <= 2)) if d.size else np.nan,
+            # The medians of dt and dx used to be here and are gone.  They
+            # read 0.0 in every run that was not already broken, and they had
+            # to: half the sub-windows would have to move before a median
+            # does, and a run with 1 % of its windows past 2 ms still showed
+            # 0.0.  What matters is the tail, so the tail is what is reported.
+            dt_p99=nanquant(d, 0.99),
+            dx_zero=nanfrac(dx_.get(b), lambda v: v == 0),
+            dt_within2=nanfrac(d, lambda v: np.abs(v) <= 2),
             peak=nanmed(pk_.get(b)),
         )
     return fake_tiles, rows
@@ -955,8 +999,8 @@ def main():
         # than measured on nothing, and the table prints a dash for it
         S_rows = {n: dict(n_trace=fb.n(b), n_pair=-1, n_tile=0, env=np.nan,
                           if_med=nanmed(fb.get(b)),
-                          centroid=nanmed(cb.get(b)), dt=np.nan, dx=np.nan,
-                          dt_within2=np.nan, peak=np.nan,
+                          centroid=nanmed(cb.get(b)), dt_p99=np.nan,
+                          dx_zero=np.nan, dt_within2=np.nan, peak=np.nan,
                           fd=np.nan, fid=np.nan)
                   for b, n in enumerate(BINS)}
 
@@ -1035,8 +1079,9 @@ def main():
     # each set was reduced to for metric 0.  A FD or FID means nothing
     # without the last one - both grow as it falls.
     hdr = ("what", "bin", "FD", "FID", "env corr", "inst f", "centroid",
-           "dt", "dx", "|dt|<=2", "peak", "n trace", "n pair", "n tile")
-    w = [7, 6, 8, 9, 10, 9, 10, 7, 7, 9, 7, 9, 8, 8]
+           "p99|dt|", "dx=0", "|dt|<=2", "peak", "n trace", "n pair",
+           "n tile")
+    w = [7, 6, 8, 9, 10, 9, 10, 9, 9, 9, 7, 9, 8, 8]
 
     def emit(label, table):
         for b, name in enumerate(BINS):
@@ -1046,8 +1091,9 @@ def main():
                   f"{fmt(r['env'], 10, 3)}"
                   f"{fmt(r['if_med'], 9, 1, 'H')}"
                   f"{fmt(r['centroid'], 10, 1, 'H')}"
-                  f"{fmt(r['dt'], 7, 1)}{fmt(r['dx'], 7, 1)}"
-                  f"{fmt(100 * r['dt_within2'], 9, 0, '%')}"
+                  f"{fmt(r['dt_p99'], 9, 1)}"
+                  f"{fmt(100 * r['dx_zero'], 9, 2, '%')}"
+                  f"{fmt(100 * r['dt_within2'], 9, 2, '%')}"
                   f"{fmt(r['peak'], 7, 3)}{r['n_trace']:>9}"
                   f"{('-' if r['n_pair'] < 0 else r['n_pair']):>8}"
                   f"{('-' if not r['n_tile'] else r['n_tile']):>8}",
