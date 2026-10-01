@@ -58,7 +58,7 @@ so the target domain has nothing out there by construction.  The output is
 therefore taken back through the input's own chain, in the input's order:
 
     1. the streamer envelope gain off - calculate_norscale_inversion
-    2. the band-pass, FILTER_PARAMS[POST_FILTER]     (process/freq_filter.py)
+    2. the band-pass, POST_FILTER_PARAMS             (process/freq_filter.py)
     3. the mute, DAS boundary from the deci sidecar  (process/rms_normalize.py)
     4. the streamer envelope gain back on            (process/logenv_process.py)
 
@@ -116,8 +116,23 @@ JOBS = (
 # see "Post-processing" in the header.  False writes the raw 3-D output.
 POST_PROCESS = True
 POST_LOG_TAG = "str"        # whose envelope gain the output carries
-POST_FILTER = "str"         # key into C.FILTER_PARAMS; None skips the filter
 POST_MUTE = True
+
+# The band-pass of step 2, in process/freq_filter.py's terms; None skips it.
+# Set here rather than taken from config.FILTER_PARAMS because the input was
+# already filtered once with those, and this is a second pass over a
+# generator's output - the corners are a judgement made from its spectrum
+# (inference/plot_far_spectrum.py), not a property of the instrument.  The
+# values below are the input's own 20-300 Hz.  Applying the same mask twice
+# squares it near both corners, -0.9 dB at 20 Hz and -5.0 dB at 300 Hz
+# measured on white noise, against -29 dB at 5 Hz and -43 dB at 400 Hz.
+# The response at PROBE_HZ is printed at the start of a run.
+POST_FILTER_PARAMS = dict(
+    highpass=True, hp_f_cut=20.0, hp_order=1.0, hp_decay=1.0,
+    lowpass=True, lp_f_cut=300.0, lp_order=0.5, lp_decay=0.5,
+    zero_dc=False, pad_front=2000,
+)
+PROBE_HZ = (5, 10, 20, 30, 50, 250, 300, 350, 400, 450)
 
 # Iterations of the gain inversion.  Measured against a gather whose gain
 # was applied and taken off again, the error relative to its peak is 6.1e-5
@@ -287,6 +302,12 @@ class BandPass:
         if params["zero_dc"]:
             mask[0] = 0.0
         self.mask = mask
+        self.freq = np.abs(np.fft.fftfreq(nt, dt_s))
+
+    def response(self, probes):
+        """Amplitude response in dB at the probe frequencies."""
+        return [(f, 20 * np.log10(max(self.mask[np.argmin(
+            np.abs(self.freq - f))], 1e-300))) for f in probes]
 
     def __call__(self, g):
         return np.real(f_filtering(padded(g, self.pad), self.mask,
@@ -426,15 +447,18 @@ def main():
     if POST_PROCESS:
         shape = (2,) + shape
         lsp = dict(C.LOG_SCALE_PARAMS[POST_LOG_TAG])
-        band = (None if POST_FILTER is None else
-                BandPass(C.FILTER_PARAMS[POST_FILTER], n_samp, dt_ms / 1000.0))
+        band = (None if POST_FILTER_PARAMS is None else
+                BandPass(POST_FILTER_PARAMS, n_samp, dt_ms / 1000.0))
         t_mute = mute_boundary(n_shot, n_recv) if POST_MUTE else None
         print(f"  post: {POST_LOG_TAG} gain off ({INV_ITERATIONS} iterations,"
               f" {GAIN_PAD_FRONT} pad) -> "
-              + (f"band-pass {POST_FILTER}" if band is not None
-                 else "no filter")
+              + ("band-pass" if band is not None else "no filter")
               + (" -> mute" if t_mute is not None else "")
               + " -> gain on;  channels (normal, log)")
+        if band is not None:
+            print(f"  band-pass {POST_FILTER_PARAMS}")
+            print("  response  " + "  ".join(
+                f"{f:g} Hz {db:.1f} dB" for f, db in band.response(PROBE_HZ)))
 
     for tag, epoch, key in JOBS:
         out_rel = C.ARRAYS["das"][key]
