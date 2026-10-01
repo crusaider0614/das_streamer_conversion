@@ -201,7 +201,9 @@ import torch
 
 import config as C
 import process.shot_geometry as G
-from inference.translate_das import MUTE_PAD_MS, remute
+import utils.mute as MU
+from inference.translate_das import (MUTE_PAD_MS, POST_FILTER_PARAMS,
+                                     BandPass, Gain, remute)
 from module.dataset_pohang_shore import PohangShoreDataset
 from module.fid import (InceptionNetwork, calculate_activation_statistics,
                         calculate_frechet_distance)
@@ -278,6 +280,26 @@ DT_S = 1.0e-3
 # wrong when it is really something the file format decides.  On the A and
 # str rows it is a no-op - their muted samples are already zero.
 REMUTE = True
+
+# Score G(A) after translate_das.py's post-processing rather than raw: the
+# streamer gain off, the POST_FILTER_PARAMS band-pass, the mute, the gain back
+# on - the chain that writes the translated file's log channel.  The gain
+# code and the filter parameters are imported from translate_das.py, so a
+# change of corners there is a change here, and the table describes the file.
+#
+# eval runs on receiver-gather windows and translate_das post-processes shot
+# gathers, which is the same thing for the streamer parameters: the envelope
+# is along time, smooth_sigma (5, 0) never mixes traces, and the front pad
+# pins the minimum the gain subtracts.  Measured on 128 traces of iden_3
+# ep 80, processed as one receiver window and again inside their 128 shot
+# gathers: identical, to the last bit, in both domains.
+#
+# On, it replaces REMUTE - the chain mutes - and it touches G(A) only: the A
+# row carries the DAS gain, not the streamer's, and both inputs are already
+# band-passed and muted.  About 40 ms a window on the GPU, so a minute and a
+# half more per checkpoint.  Off by default so the table stays comparable
+# with the ones before it.
+POST_PROCESS = False
 
 # Metric 0.  The CROP windows are cut into tiles of this size, because
 # Inception takes a roughly square image and a 2000 x 128 gather resized to
@@ -419,6 +441,42 @@ def offsets(stage):
     inside, outside = shared_split(z["receiver_xy"])
     keep = inside if stage == "rg_train" else outside
     return off[keep]
+
+
+def mute_rows(stage):
+    """(n_receiver, n_shot) mute boundary in ms, on the rg arrays' axes.
+
+    The deci sidecar's, which is the boundary the input was muted with, put
+    in sorted shot order and split by stage the same way `offsets` is.
+    """
+    order = np.asarray(G.sorted_order()["orig_idx"], dtype=int)
+    z = np.load(resolve(C.META["das_deci"]))
+    t = z["mute_boundary_ms"][order].T.astype(np.float64)
+    if stage == "all":
+        return t
+    inside, outside = shared_split(z["receiver_xy"])
+    return t[inside if stage == "rg_train" else outside]
+
+
+class Post:
+    """translate_das.py's post-processing, on one normalised G(A) window."""
+
+    def __init__(self, stage, value_range):
+        self.vr = value_range
+        self.gain = Gain(C.LOG_SCALE_PARAMS["str"],
+                         DEVICE if DEVICE.startswith("cuda") else None)
+        self.band = (None if POST_FILTER_PARAMS is None
+                     else BandPass(POST_FILTER_PARAMS, CROP[0], DT_S))
+        self.t = mute_rows(stage)
+
+    def __call__(self, fake, k, x0):
+        # back to the streamer's log amplitude, where the gain is defined
+        g = self.gain.invert(fake * self.vr)
+        if self.band is not None:
+            g = self.band(g)
+        g = g * MU.weights(self.t[k, x0:x0 + fake.shape[1]], g.shape[0],
+                           DT_S * 1000.0)
+        return self.gain.apply(g) / self.vr
 
 
 def which_bin(offset):
@@ -882,7 +940,7 @@ def reference_str(B_ds, off_b, recv, starts):
 MUTE_PAD = int(round(MUTE_PAD_MS / (DT_S * 1000.0)))
 
 
-def score(transform, A_ds, B_ds, off_a, recv, starts):
+def score(transform, A_ds, B_ds, off_a, recv, starts, post=None):
     """Every metric for `transform(A)`, per offset bin.
 
     `transform` is the generator, or `identity` for the untranslated input -
@@ -901,7 +959,9 @@ def score(transform, A_ds, B_ds, off_a, recv, starts):
             off = off_a[k, x0:x0 + nx]
             bins = which_bin(off)
             fake = transform(a)
-            if REMUTE:
+            if post is not None:
+                fake = post(fake, k, x0)
+            elif REMUTE:
                 remute(fake, a, MUTE_PAD)
 
             br = A_ds.b_row.get(k)
@@ -984,7 +1044,19 @@ def main():
     frac = float(np.mean(seen < OFFSET_SPLIT_M))
     print(f"  offset split at {OFFSET_SPLIT_M} m: {100 * frac:.2f} % of the "
           f"scored traces are near, {100 * (1 - frac):.2f} % far")
-    if REMUTE:
+    post = None
+    if POST_PROCESS:
+        vr = (B_ds.value_range if B_ds is not None else
+              PohangShoreDataset(is_das=False, crop_size=None, total_length=1,
+                                 stage="rg_train").value_range)
+        post = Post(STAGE, vr)
+        if post.t.shape != off_a.shape:
+            raise SystemExit(f"mute boundary {post.t.shape} against offsets "
+                             f"{off_a.shape}")
+        print(f"  G(A) post-processed as translate_das.py writes it: str gain"
+              f" off on {post.gain.dev or 'cpu'}, band-pass "
+              f"{POST_FILTER_PARAMS}, mute, gain on; x/ {vr:.4f}")
+    elif REMUTE:
         print(f"  G(A) remuted from the input, {MUTE_PAD_MS:g} ms pad "
               f"({MUTE_PAD} samples) - the same call translate_das.py makes")
     if B_ds is None:
@@ -1131,7 +1203,8 @@ def main():
     for ep, path in ck:
         state = torch.load(path, map_location="cpu")
         g, ch = build_generator(state["G_A2B"])
-        fake_tiles, m = score(translator(g), A_ds, B_ds, off_a, recv, starts)
+        fake_tiles, m = score(translator(g), A_ds, B_ds, off_a, recv, starts,
+                              post)
         for b, name in enumerate(BINS):
             ok = bool(fid_n[b]) and len(fake_tiles[b]) >= fid_n[b]
             m[name]["n_tile"] = fid_n[b] if ok else 0
