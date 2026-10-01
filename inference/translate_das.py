@@ -2,7 +2,9 @@
 
     das_data_rg_train.npy  (24, 2000, 551)   receivers 12..35
     das_data_rg_infer.npy  (240, 2000, 551)  the other 240
-        ->  das_data_fake_str.npy  (551, 2000, 264)
+        ->  das_data_fake_str_<...>.npy  (2, 551, 2000, 264)
+                channel 0  normal - the envelope gain off, band-passed, muted
+                channel 1  log    - the same with the streamer gain put back
 
 The generator takes one CROP-sized window, 2000 samples by 128 shots, which
 is what it was trained on: the time axis is the whole record and must stay
@@ -47,6 +49,35 @@ differently scaled versions of the same instrument, and it never saw the
 second one.  The output comes back through the streamer's own `value_range`
 so the file sits on the same amplitude scale as str_data_rg_train.npy.
 
+Post-processing
+---------------
+The generator's raw output is band-unlimited: it carries 20-30 dB more than
+the streamer above 300 Hz, where neither input has anything, and a DC offset.
+Both instruments were band-passed to 20-300 Hz before they were normalised,
+so the target domain has nothing out there by construction.  The output is
+therefore taken back through the input's own chain, in the input's order:
+
+    1. the streamer envelope gain off - calculate_norscale_inversion
+    2. the band-pass, FILTER_PARAMS[POST_FILTER]     (process/freq_filter.py)
+    3. the mute, DAS boundary from the deci sidecar  (process/rms_normalize.py)
+    4. the streamer envelope gain back on            (process/logenv_process.py)
+
+The filter has to act in the normal domain.  The gain is a smooth multiplier
+in time, which spreads the spectrum by a few tens of hertz - the streamer's
+own log-domain spectrum rolls off between 300 and 380 Hz rather than at 300 -
+so cutting in the log domain would also remove that legitimate spread.
+
+The mute comes before the gain because that is the order the input was built
+in: rms_normalize mutes `deci` into `norm`, and logenv_process gains `norm`,
+which on disk already has the muted top at exact zero.  It matters even
+though both are multiplications: the gain is estimated from the envelope, and
+an envelope with the pre-arrival noise still in it gives a different gain.
+No RMS step - the inverted output is already at the normalised scale.
+
+Both ends are kept: channel 0 after step 3, channel 1 after step 4, so the
+file has a channel axis in front.  POST_PROCESS False writes the raw 3-D
+output as before.
+
 Edit the settings block, then run from the repository root:
 
     python -m inference.translate_das
@@ -60,17 +91,43 @@ import torch
 import yacs.config
 
 import config as C
+import process.shot_geometry as G
+import utils.mute as MU
 from module.dataset_pohang_shore import PohangShoreDataset
 from network.pohang_shore_network_aniso import get_gen_model
 from utils.data import create_memmap, get_project_root
+from utils.process import (calculate_logscale, calculate_norscale_inversion,
+                           f_filter, f_filtering)
 
 # ---------------------------------------------------------------- settings --
 
 CONFIG = os.path.join("config", "pohang_shore_das_str_cut.yaml")
-EPOCH = 140
 
-# Where the result goes, relative to the project root.
-OUT_NPY = C.ARRAYS["das"]["fake_str"]
+# (checkpoint tag, epoch, key in C.ARRAYS["das"]), run in turn.  CONFIG's
+# model section builds the generator for all of them; only the weights
+# differ, and load_state_dict is strict, so a mismatch fails loudly.
+JOBS = (
+    ("pohang_shore_das_str_cut_iden", 150, "fake_str_150"),
+    ("pohang_shore_das_str_cut_iden_3", 80, "fake_str_m_inp_080"),
+    ("pohang_shore_das_str_cut_iden_3", 140, "fake_str_m_inp_140"),
+)
+
+# Take the output back through the input's chain and write both domains -
+# see "Post-processing" in the header.  False writes the raw 3-D output.
+POST_PROCESS = True
+POST_LOG_TAG = "str"        # whose envelope gain the output carries
+POST_FILTER = "str"         # key into C.FILTER_PARAMS; None skips the filter
+POST_MUTE = True
+
+# Iterations of the gain inversion.  Measured against a gather whose gain
+# was applied and taken off again, the error relative to its peak is 6.1e-5
+# after 20 and 3.6e-7 after 50; 20 is about 2 s a shot, 50 about 6.
+INV_ITERATIONS = 20
+
+# Zeros in front of each shot gather while the gain is fitted or inverted.
+# Must match process/logenv_process.PAD_FRONT: the pad pins
+# calculate_logscale's minimum, so a different one is a different gain.
+GAIN_PAD_FRONT = 2000
 
 # The window the generator sees, (samples, shots).  Match the training
 # CROP_SIZE; the time entry has to be the full record.
@@ -101,7 +158,7 @@ OUT_VALUE_RANGE = None
 # puts the mute back, taken from the input: the streamer arrays are muted, so
 # leaving it out would be the one obvious way to tell this file from a real
 # one.
-REMUTE_FROM_INPUT = True
+REMUTE_FROM_INPUT = False
 
 # How far above the mute boundary the zeroing stops, in ms.  The boundary is
 # not a hard edge - the mute carries a 30 ms raised-cosine taper - and only
@@ -119,7 +176,7 @@ BATCH = 4
 # training config names GPUS [4, 5, 6, 7] and the older test script hard-codes
 # cuda:9.  So the index is written out.  None runs on the CPU, which works
 # but is slow: the FID's Inception dominates everything there.
-GPU = 4
+GPU = 0
 DEVICE = (f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available()
           else "cpu")
 
@@ -197,9 +254,83 @@ def shared_split(rec_xy):
             np.flatnonzero((a_rec < lo) | (a_rec > hi)))
 
 
-def load_generator(CF):
-    path = resolve(os.path.join("checkpoint",
-                                f"{CF.TAG}_{str(EPOCH).zfill(3)}"))
+def padded(g, n):
+    return np.concatenate([np.zeros((n, g.shape[1])), g], axis=0)
+
+
+def invert_gain(g, lsp):
+    """The envelope gain off one shot gather."""
+    _, est = calculate_norscale_inversion(padded(g, GAIN_PAD_FRONT),
+                                          iterations=INV_ITERATIONS, **lsp)
+    return est[GAIN_PAD_FRONT:]
+
+
+def apply_gain(g, lsp):
+    """The envelope gain on, as process/logenv_process.logscale fits it."""
+    scale = calculate_logscale(padded(g, GAIN_PAD_FRONT), **lsp)
+    return g * scale[GAIN_PAD_FRONT:]
+
+
+class BandPass:
+    """process/freq_filter.py's mask and padding, for one gather length."""
+
+    def __init__(self, params, n_samp, dt_s):
+        self.pad = params["pad_front"]
+        nt = self.pad + n_samp
+        mask = np.ones(nt)
+        if params["lowpass"]:
+            mask *= f_filter(nt, dt_s, params["lp_f_cut"], params["lp_order"],
+                             params["lp_decay"], is_lowpass=True)
+        if params["highpass"]:
+            mask *= f_filter(nt, dt_s, params["hp_f_cut"], params["hp_order"],
+                             params["hp_decay"], is_lowpass=False)
+        if params["zero_dc"]:
+            mask[0] = 0.0
+        self.mask = mask
+
+    def __call__(self, g):
+        return np.real(f_filtering(padded(g, self.pad), self.mask,
+                                   is_zeroout=False))[self.pad:]
+
+
+def mute_boundary(n_shot, n_recv):
+    """(shot, receiver) mute boundary in ms, in the arrays' sorted order.
+
+    The deci sidecar's, which is the boundary rms_normalize muted the input
+    with; it is in recording order, the arrays here are sorted.
+    """
+    t = np.load(resolve(C.META["das_deci"]))["mute_boundary_ms"]
+    if t.shape != (n_shot, n_recv):
+        raise SystemExit(f"mute boundary is {t.shape}, expected "
+                         f"({n_shot}, {n_recv})")
+    order = np.asarray(G.sorted_order()["orig_idx"], dtype=int)
+    return t[order]
+
+
+def post_process(out, lsp, band, t_mute, dt_ms):
+    """Channel 1 holds the raw output on entry; both channels on exit."""
+    n_shot = out.shape[1]
+    sample_major = OUT_ORDER[1] == "sample"
+    t0 = time.time()
+    for i in range(n_shot):
+        g = np.asarray(out[1, i], dtype=np.float64)
+        g = g if sample_major else g.T
+        g = invert_gain(g, lsp)
+        if band is not None:
+            g = band(g)
+        if t_mute is not None:
+            g = g * MU.weights(t_mute[i], g.shape[0], dt_ms)
+        log = apply_gain(g, lsp)
+        out[0, i] = (g if sample_major else g.T).astype(np.float32)
+        out[1, i] = (log if sample_major else log.T).astype(np.float32)
+        if (i + 1) % 50 == 0 or i + 1 == n_shot:
+            el = time.time() - t0
+            print(f"    {i + 1}/{n_shot} shots  {el:.0f}s elapsed, "
+                  f"eta {el / (i + 1) * (n_shot - i - 1):.0f}s", flush=True)
+
+
+def load_generator(CF, tag, epoch):
+    path = resolve(os.path.join("checkpoint", f"{tag}_{str(epoch).zfill(3)}"))
     if not os.path.isfile(path):
         raise SystemExit(f"not found: {path}")
     state = torch.load(path, map_location="cpu")
@@ -242,7 +373,7 @@ def translate_gather(gen, gather, starts, w, in_range, out_range):
 def main():
     with open(resolve(CONFIG), "rt") as f:
         CF = yacs.config.load_cfg(f)
-    print(f"{CF.TAG}, epoch {EPOCH}   device {DEVICE}")
+    print(f"{len(JOBS)} job(s)   device {DEVICE}")
 
     A_train = PohangShoreDataset(is_das=True, crop_size=None, total_length=1,
                                  stage="rg_train")
@@ -275,7 +406,6 @@ def main():
                          f" - the time axis is not tiled, so they must match")
     dt_ms = C.STAGE_DT_US["das"]["norm"] / 1000.0
     pad = int(round(MUTE_PAD_MS / dt_ms))
-    cut_ms = []
     if REMUTE_FROM_INPUT:
         print(f"  remute: the input's exact-zero run less a {MUTE_PAD_MS:g} "
               f"ms pad ({pad} samples); the taper is left alone")
@@ -293,39 +423,66 @@ def main():
         raise SystemExit(f"OUT_ORDER {OUT_ORDER} is not one of "
                          f"{list(shape)}")
     shape = shape[tuple(OUT_ORDER)]
-    out_path = resolve(OUT_NPY)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    out = create_memmap(out_path, shape)
-    print(f"  output {out.shape} {OUT_ORDER}, {out.nbytes / 1e9:.2f} GB")
+    if POST_PROCESS:
+        shape = (2,) + shape
+        lsp = dict(C.LOG_SCALE_PARAMS[POST_LOG_TAG])
+        band = (None if POST_FILTER is None else
+                BandPass(C.FILTER_PARAMS[POST_FILTER], n_samp, dt_ms / 1000.0))
+        t_mute = mute_boundary(n_shot, n_recv) if POST_MUTE else None
+        print(f"  post: {POST_LOG_TAG} gain off ({INV_ITERATIONS} iterations,"
+              f" {GAIN_PAD_FRONT} pad) -> "
+              + (f"band-pass {POST_FILTER}" if band is not None
+                 else "no filter")
+              + (" -> mute" if t_mute is not None else "")
+              + " -> gain on;  channels (normal, log)")
 
-    gen = load_generator(CF)
+    for tag, epoch, key in JOBS:
+        out_rel = C.ARRAYS["das"][key]
+        print(f"\n{tag}, epoch {epoch}  ->  {out_rel}")
+        out_path = resolve(out_rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        out = create_memmap(out_path, shape)
+        axes = (("channel",) if POST_PROCESS else ()) + tuple(OUT_ORDER)
+        print(f"  output {out.shape} {axes}, {out.nbytes / 1e9:.2f} GB")
+        # the raw output goes where the log channel will end up
+        raw = out[1] if POST_PROCESS else out
 
-    t0 = time.time()
-    done = 0
-    for ds, where in ((A_train, inside), (A_infer, outside)):
-        for k, r in enumerate(where):
-            g = np.array(ds.data[k], dtype=np.float32)
-            np.clip(g, in_clip[0], in_clip[1], out=g)
-            fake = translate_gather(gen, g, starts, w, in_range, out_range)
-            if REMUTE_FROM_INPUT:
-                cut_ms.append(remute(fake, g, pad).mean() * dt_ms)
-            # (n_samp, n_shot) -> the output's own axes
-            if OUT_ORDER[1] == "sample":
-                out[:, :, r] = fake.T.astype(np.float32)
-            else:
-                out[:, r, :] = fake.T.astype(np.float32)
-            done += 1
-            if done % REPORT_EVERY == 0 or done == n_recv:
-                el = time.time() - t0
-                print(f"    {done}/{n_recv} receivers  {el:.0f}s elapsed, "
-                      f"eta {el / done * (n_recv - done):.0f}s", flush=True)
+        gen = load_generator(CF, tag, epoch)
+        cut_ms = []
+        t0 = time.time()
+        done = 0
+        for ds, where in ((A_train, inside), (A_infer, outside)):
+            for k, r in enumerate(where):
+                g = np.array(ds.data[k], dtype=np.float32)
+                np.clip(g, in_clip[0], in_clip[1], out=g)
+                fake = translate_gather(gen, g, starts, w, in_range, out_range)
+                if REMUTE_FROM_INPUT:
+                    cut_ms.append(remute(fake, g, pad).mean() * dt_ms)
+                # (n_samp, n_shot) -> the output's own axes
+                if OUT_ORDER[1] == "sample":
+                    raw[:, :, r] = fake.T.astype(np.float32)
+                else:
+                    raw[:, r, :] = fake.T.astype(np.float32)
+                done += 1
+                if done % REPORT_EVERY == 0 or done == n_recv:
+                    el = time.time() - t0
+                    print(f"    {done}/{n_recv} receivers  {el:.0f}s elapsed, "
+                          f"eta {el / done * (n_recv - done):.0f}s",
+                          flush=True)
+        del gen
+        if DEVICE.startswith("cuda"):
+            torch.cuda.empty_cache()
+        if cut_ms:
+            print(f"  remuted to a mean of {np.mean(cut_ms):.0f} ms, "
+                  f"{np.min(cut_ms):.0f}..{np.max(cut_ms):.0f} across "
+                  f"receivers")
 
-    out.flush()
-    del out
-    if cut_ms:
-        print(f"  remuted to a mean of {np.mean(cut_ms):.0f} ms, "
-              f"{np.min(cut_ms):.0f}..{np.max(cut_ms):.0f} across receivers")
-    print(f"  wrote {OUT_NPY}")
+        if POST_PROCESS:
+            print("  post-processing shot gathers")
+            post_process(out, lsp, band, t_mute, dt_ms)
+        out.flush()
+        del out
+        print(f"  wrote {out_rel}")
 
 
 if __name__ == "__main__":
