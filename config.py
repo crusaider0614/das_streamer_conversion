@@ -89,6 +89,10 @@ ARRAYS = {
         "fake_str_150": os.path.join(DATA_DIR, "das_data_fake_str_150.npy"),
         "fake_str_m_inp_080": os.path.join(DATA_DIR, "das_data_fake_str_m_inp_080.npy"),
         "fake_str_m_inp_140": os.path.join(DATA_DIR, "das_data_fake_str_m_inp_140.npy"),
+        # The generator's input laid out like the translated files -
+        # (2, shot, sample, receiver), channel 0 normal, channel 1 log, shots
+        # sorted along the line - by inference/export_das_input.py.
+        "input_nl": os.path.join(DATA_DIR, "das_data_input_nl.npy"),
     },
     "str": {
         "raw": os.path.join(NPY_DIR, "str_data_raw.npy"),
