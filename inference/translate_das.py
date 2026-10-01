@@ -131,8 +131,8 @@ POST_MUTE = True
 # move them outwards if the band edges should survive.  The mask's response
 # at PROBE_HZ is printed at the start of a run.
 POST_FILTER_PARAMS = dict(
-    highpass=True, hp_f_cut=20.0, hp_order=1.0, hp_decay=1.0,
-    lowpass=True, lp_f_cut=300.0, lp_order=0.5, lp_decay=0.5,
+    highpass=True, hp_f_cut=10.0, hp_order=1.0, hp_decay=1.0,
+    lowpass=True, lp_f_cut=320.0, lp_order=0.5, lp_decay=0.5,
     zero_dc=False, pad_front=2000,
 )
 PROBE_HZ = (5, 10, 20, 30, 50, 250, 300, 350, 400, 450)

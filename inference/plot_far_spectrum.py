@@ -67,8 +67,8 @@ from utils.process import calculate_norscale_inversion
 # The label is needed because the file does not record which checkpoint
 # wrote it.
 FAKES = (
-    ("fake_str_150", "iden ep 150"),
-    ("fake_str_m_inp_080", "iden_3 ep 80"),
+    # ("fake_str_150", "iden ep 150"),
+    # ("fake_str_m_inp_080", "iden_3 ep 80"),
     ("fake_str_m_inp_140", "iden_3 ep 140"),
 )
 FAKE_COLOURS = ("tab:red", "tab:orange", "tab:green", "tab:purple",

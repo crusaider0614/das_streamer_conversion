@@ -27,14 +27,14 @@ from utils.data import get_project_root
 # Array to plot.  A relative path resolves against the project root, not the
 # working directory, so this works the same however the script is launched.
 # NPY_PATH = os.path.join("data", "pohang_shore", "numpy", "str_data_raw.npy")
-NPY_PATH = os.path.join("data", "pohang_shore", "das_data_fake_str_m_inp_080.npy")
+NPY_PATH = os.path.join("data", "pohang_shore", "das_data_fake_str_m_inp_140.npy")
 
 # For a (channel, shot, sample, receiver) file from inference/translate_das.py:
 # 0 is the normal domain, 1 the log.  Ignored for a 3-D array.
 CHANNEL = 1
 
 # Which shots: every STEP-th from START up to STOP (STOP = None -> to the end).
-STEP = 10
+STEP = 50
 START = 0
 STOP = None
 
