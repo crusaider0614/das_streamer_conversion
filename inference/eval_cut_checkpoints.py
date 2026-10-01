@@ -202,8 +202,8 @@ import torch
 import config as C
 import process.shot_geometry as G
 import utils.mute as MU
-from inference.translate_das import (MUTE_PAD_MS, POST_FILTER_PARAMS,
-                                     BandPass, Gain, remute)
+import inference.translate_das as TR
+from inference.translate_das import MUTE_PAD_MS, BandPass, Gain, remute
 from module.dataset_pohang_shore import PohangShoreDataset
 from module.fid import (InceptionNetwork, calculate_activation_statistics,
                         calculate_frechet_distance)
@@ -294,12 +294,17 @@ REMUTE = True
 # ep 80, processed as one receiver window and again inside their 128 shot
 # gathers: identical, to the last bit, in both domains.
 #
+# Every setting of the chain is read from translate_das.py at run time, not
+# copied: POST_LOG_TAG, POST_FILTER_PARAMS, POST_MUTE, INV_ITERATIONS,
+# INV_INIT, GAIN_ON_GPU and GAIN_PAD_FRONT.  Change them there.
+#
 # On, it replaces REMUTE - the chain mutes - and it touches G(A) only: the A
 # row carries the DAS gain, not the streamer's, and both inputs are already
-# band-passed and muted.  About 40 ms a window on the GPU, so a minute and a
-# half more per checkpoint.  Off by default so the table stays comparable
-# with the ones before it.
-POST_PROCESS = False
+# band-passed and muted.  About 0.23 s a window on the GPU at 50 iterations,
+# some eight minutes a checkpoint.  Tables scored with it off - every one
+# before this setting existed - are not comparable with tables scored with it
+# on.
+POST_PROCESS = True
 
 # Metric 0.  The CROP windows are cut into tiles of this size, because
 # Inception takes a roughly square image and a 2000 x 128 gather resized to
@@ -459,24 +464,65 @@ def mute_rows(stage):
 
 
 class Post:
-    """translate_das.py's post-processing, on one normalised G(A) window."""
+    """translate_das.py's post-processing, on one normalised G(A) window.
+
+    Step for step what translate_das.post_process does to a shot gather, with
+    translate_das's own settings, applied to the traces of a receiver window
+    instead - see POST_PROCESS for why that is the same thing.
+    """
 
     def __init__(self, stage, value_range):
         self.vr = value_range
-        self.gain = Gain(C.LOG_SCALE_PARAMS["str"],
-                         DEVICE if DEVICE.startswith("cuda") else None)
-        self.band = (None if POST_FILTER_PARAMS is None
-                     else BandPass(POST_FILTER_PARAMS, CROP[0], DT_S))
-        self.t = mute_rows(stage)
+        on_gpu = TR.GAIN_ON_GPU and DEVICE.startswith("cuda")
+        self.gain = Gain(C.LOG_SCALE_PARAMS[TR.POST_LOG_TAG],
+                         DEVICE if on_gpu else None)
+        self.band = (None if TR.POST_FILTER_PARAMS is None
+                     else BandPass(TR.POST_FILTER_PARAMS, CROP[0], DT_S))
+        self.t = mute_rows(stage) if TR.POST_MUTE else None
+
+        # INV_INIT "das": translate_das's cached starting gain, which is on
+        # the whole line's receiver axis, so the stage's rows map back to it
+        self.init = None
+        if TR.INV_INIT == "das":
+            self.full = stage_receivers(stage)
+            n_shot = len(G.sorted_order()["orig_idx"])
+            n_recv = len(np.load(resolve(C.META["das_deci"]))["receiver_xy"])
+            self.init = TR.init_gain(self.gain, n_shot, CROP[0], n_recv)
+        elif TR.INV_INIT is not None:
+            raise SystemExit(f"translate_das.INV_INIT {TR.INV_INIT!r} is not "
+                             f"'das' or None")
+
+    def describe(self):
+        return (f"{TR.POST_LOG_TAG} gain off ({TR.INV_ITERATIONS} iterations,"
+                f" start {TR.INV_INIT or 'scale 1'}, on "
+                f"{self.gain.dev or 'cpu'}) -> "
+                + (f"band-pass {TR.POST_FILTER_PARAMS}"
+                   if self.band is not None else "no filter")
+                + (" -> mute" if self.t is not None else "")
+                + " -> gain on")
 
     def __call__(self, fake, k, x0):
+        nx = fake.shape[1]
+        init = (None if self.init is None else
+                np.asarray(self.init[x0:x0 + nx, :, self.full[k]],
+                           dtype=np.float64).T)
         # back to the streamer's log amplitude, where the gain is defined
-        g = self.gain.invert(fake * self.vr)
+        g = self.gain.invert(fake * self.vr, init)
         if self.band is not None:
             g = self.band(g)
-        g = g * MU.weights(self.t[k, x0:x0 + fake.shape[1]], g.shape[0],
-                           DT_S * 1000.0)
+        if self.t is not None:
+            g = g * MU.weights(self.t[k, x0:x0 + nx], g.shape[0],
+                               DT_S * 1000.0)
         return self.gain.apply(g) / self.vr
+
+
+def stage_receivers(stage):
+    """Whole-line receiver index of each row of the stage's arrays."""
+    rec = np.load(resolve(C.META["das_deci"]))["receiver_xy"]
+    if stage == "all":
+        return np.arange(len(rec))
+    inside, outside = shared_split(rec)
+    return inside if stage == "rg_train" else outside
 
 
 def which_bin(offset):
@@ -1050,12 +1096,11 @@ def main():
               PohangShoreDataset(is_das=False, crop_size=None, total_length=1,
                                  stage="rg_train").value_range)
         post = Post(STAGE, vr)
-        if post.t.shape != off_a.shape:
+        if post.t is not None and post.t.shape != off_a.shape:
             raise SystemExit(f"mute boundary {post.t.shape} against offsets "
                              f"{off_a.shape}")
-        print(f"  G(A) post-processed as translate_das.py writes it: str gain"
-              f" off on {post.gain.dev or 'cpu'}, band-pass "
-              f"{POST_FILTER_PARAMS}, mute, gain on; x/ {vr:.4f}")
+        print(f"  G(A) post-processed as translate_das.py writes it, x/ "
+              f"{vr:.4f}: {post.describe()}")
     elif REMUTE:
         print(f"  G(A) remuted from the input, {MUTE_PAD_MS:g} ms pad "
               f"({MUTE_PAD} samples) - the same call translate_das.py makes")
