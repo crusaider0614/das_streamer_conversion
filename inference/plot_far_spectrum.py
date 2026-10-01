@@ -36,7 +36,8 @@ process/logenv_process.py.  The streamer parameters smooth over time only
 inverting the whole gather - about half a second a shot for "paired", six for
 "all", so raise SHOT_STEP for that.
 
-Spectra are averaged as power and drawn as amplitude in dB.  With
+Spectra are averaged as power and drawn in dB with every curve scaled to the
+same total power - the same RMS - so their heights compare directly.  With
 PER_TRACE_NORM each trace's power spectrum is divided by its own total before
 averaging, so every trace counts once - the same weighting the per-trace
 centroid in eval_cut_checkpoints.py has.  Without it the loud traces dominate.
@@ -291,26 +292,35 @@ def main():
         print(f"  {name:22s} {acc[k].n:7d} traces   centroid "
               f"{centroid(f, p):6.1f} Hz   peak {f[np.argmax(p)]:6.1f} Hz")
 
+    # Every curve scaled to the same total power, which by Parseval is every
+    # dataset scaled to the same RMS, so the curves sit at comparable heights
+    # and a difference between them is how that power is spread over
+    # frequency.  The sum runs over the whole spectrum, not just the drawn
+    # band, so energy above F_MAX_HZ still counts.  0 dB is the level a flat
+    # spectrum with the same total would have.
+    def unit(p):
+        return p / p.sum() * len(p)
+
     def db(p):
-        return 10 * np.log10(np.maximum(p, 1e-30) / p[band].max())
+        return 10 * np.log10(np.maximum(unit(p), 1e-30))
 
     fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(9, 8), sharex=True,
                                    gridspec_kw=dict(height_ratios=(2, 1)))
     for name, colour, p in curves.values():
         ax0.plot(f[band], db(p)[band], color=colour, lw=1.2,
                  label=f"{name}  ({centroid(f, p):.1f} Hz)")
-    ax0.set_ylabel("amplitude [dB, own peak = 0]")
+    ax0.set_ylabel("power [dB, equal RMS; flat = 0]")
     ax0.set_title(f"far offsets (>= {split:.1f} m), {RECEIVERS} receivers, "
                   f"{DOMAIN} domain", fontsize=10)
     ax0.legend(fontsize=9)
     ax0.grid(alpha=0.3)
 
-    # Both against the streamer, each normalised to its total power first so
-    # the ratio is a difference of spectral shape and not of overall level.
-    ref = curves["str"][2] / curves["str"][2][band].sum()
+    # Each against the streamer at the same equal-RMS scaling, so this is
+    # exactly the vertical gap between two curves above.
+    ref = unit(curves["str"][2])
     for k in [k for k in curves if k != "str"]:
         name, colour, p = curves[k]
-        r = (p / p[band].sum()) / np.maximum(ref, 1e-30)
+        r = unit(p) / np.maximum(ref, 1e-30)
         ax1.plot(f[band], 10 * np.log10(np.maximum(r, 1e-30))[band],
                  color=colour, lw=1.2, label=f"{name} / streamer")
     ax1.axhline(0, color="k", lw=0.8)
