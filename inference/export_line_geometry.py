@@ -1,7 +1,13 @@
-"""Shot and receiver positions of the translated DAS file, as 2-D grid indices.
+"""Shot and receiver positions of the translated DAS files, along the line.
 
-    das_data_fake_str.npy  (551 shots, 2000 samples, 264 receivers)
+    das_data_fake_str*.npy  (551 shots, 2000 samples, 264 receivers)
         ->  export/fake_str_geometry.txt
+
+Every position is given three ways: the along-line coordinate and its 2-D
+grid index; the projected point back in the survey's own map coordinates
+(x_proj, y_proj - easting and northing, the SEG-Y frame); and the position
+before projection (x_orig, y_orig).  The first two describe the same point,
+the third is where it was recorded.
 
 The survey is a line the boat wandered about - a degree-5 polynomial fit
 reduces the residual by only 4 % and its arc length matches the straight
@@ -41,8 +47,10 @@ bookkeeping rather than geometry.
 
 "uniform" lays the 264 receivers at exactly DAS_STRIDE x
 DAS_CHANNEL_INTERVAL_M x 12 = 3.00 m, centred on the same midpoint.  That is
-the interval the fibre actually has, and it is the default.  The difference
-between the two is up to 6 m at the ends.
+the interval the fibre actually has, and it is the default.  It runs in the
+direction the header positions do - receiver index northward, which is down
+the along-line axis.  Against the header positions the difference is 3.6 m
+rms, -4.3 m at receiver 0 and 10.9 m at receiver 263.
 
 Edit the settings block, then run from the repository root:
 
@@ -93,26 +101,43 @@ def line_frame():
 
 
 def positions():
-    """Along-line metres for the receivers and for the sorted shots."""
+    """Along-line metres for the receivers and the sorted shots, plus the
+    unprojected map positions of both, shots in the same sorted order."""
     c, u = line_frame()
     z = np.load(resolve(C.META["das_deci"]))
-    a_rec = (z["receiver_xy"] - c) @ u
+    rec_xy = np.asarray(z["receiver_xy"], dtype=np.float64)
+    a_rec = (rec_xy - c) @ u
 
     if RECEIVER_POSITIONS == "uniform":
         n = len(a_rec)
         dx = C.DAS_CHANNEL_INTERVAL_M * int(z["stride"])
-        a_rec = (np.arange(n) - (n - 1) / 2.0) * dx + a_rec.mean()
+        # In the direction the header positions run.  The receiver index
+        # increases northward and the along-line axis southward, so laying
+        # the index out along +along put receiver 0 at the far end - every
+        # receiver mirrored about the midpoint, up to 789 m off.
+        step = np.sign(np.polyfit(np.arange(n), a_rec, 1)[0])
+        a_rec = (np.arange(n) - (n - 1) / 2.0) * dx * step + a_rec.mean()
     elif RECEIVER_POSITIONS != "header":
         raise SystemExit(f"RECEIVER_POSITIONS {RECEIVER_POSITIONS!r} is not "
                          f"'uniform' or 'header'")
 
     order = np.asarray(G.sorted_order()["orig_idx"], dtype=int)
     a_src = ((z["source_xy_projected"] - c) @ u)[order]
-    return a_rec, a_src, order
+    # the recorded source positions; deci only carries the projected ones
+    src_xy = np.asarray(np.load(resolve(C.META["das_line"]))["source_xy"],
+                        dtype=np.float64)[order]
+    return a_rec, a_src, order, rec_xy, src_xy
+
+
+def on_line(a):
+    """Along-line metres -> the projected point in map coordinates."""
+    c, u = line_frame()
+    return np.asarray(c)[None, :] + np.asarray(a)[:, None] * np.asarray(u)
 
 
 def main():
-    a_rec, a_src, order = positions()
+    a_rec, a_src, order, rec_xy, src_xy = positions()
+    rec_p, src_p = on_line(a_rec), on_line(a_src)
     lo = min(a_rec.min(), a_src.min()) if ORIGIN == "min" else float(ORIGIN)
     ix = lambda a: (a - lo) / DX_M
 
@@ -134,8 +159,10 @@ def main():
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         w = f.write
-        w("# shot and receiver positions of das_data_fake_str.npy\n")
+        w("# shot and receiver positions of das_data_fake_str*.npy\n")
         w("# projected onto the principal axis of the shot positions\n")
+        w("# x_proj y_proj: the projected point in map coordinates\n")
+        w("# x_orig y_orig: the recorded position, before projection\n")
         w("#\n")
         w(f"# line centroid   {line_frame()[0][0]:.3f} "
           f"{line_frame()[0][1]:.3f}\n")
@@ -152,15 +179,21 @@ def main():
         w("# the recording index of the same shot\n")
         w("#\n")
         w(f"# receivers: {len(a_rec)}\n")
-        w("# index  along_m        ix      iz\n")
+        w("# index  along_m        ix      iz        x_proj         y_proj"
+          "        x_orig         y_orig\n")
         for i, a in enumerate(a_rec):
             w(f"R {i:5d} {a:12.3f} {ix(a):10.3f} "
-              f"{RECEIVER_DEPTH_M / DZ_M:7.3f}\n")
+              f"{RECEIVER_DEPTH_M / DZ_M:7.3f} "
+              f"{rec_p[i, 0]:14.3f} {rec_p[i, 1]:14.3f} "
+              f"{rec_xy[i, 0]:14.3f} {rec_xy[i, 1]:14.3f}\n")
         w(f"#\n# shots: {len(a_src)}\n")
-        w("# index   orig  along_m        ix      iz\n")
+        w("# index   orig  along_m        ix      iz        x_proj"
+          "         y_proj        x_orig         y_orig\n")
         for i, a in enumerate(a_src):
             w(f"S {i:5d} {order[i]:6d} {a:12.3f} {ix(a):10.3f} "
-              f"{SOURCE_DEPTH_M / DZ_M:7.3f}\n")
+              f"{SOURCE_DEPTH_M / DZ_M:7.3f} "
+              f"{src_p[i, 0]:14.3f} {src_p[i, 1]:14.3f} "
+              f"{src_xy[i, 0]:14.3f} {src_xy[i, 1]:14.3f}\n")
     print(f"  wrote {OUT_TXT}  ({os.path.getsize(p) / 1e6:.2f} MB)")
 
 
