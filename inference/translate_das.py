@@ -57,7 +57,9 @@ Both instruments were band-passed to 20-300 Hz before they were normalised,
 so the target domain has nothing out there by construction.  The output is
 therefore taken back through the input's own chain, in the input's order:
 
-    1. the streamer envelope gain off - calculate_norscale_inversion
+    1. the streamer envelope gain off - the fixed-point inversion of
+       utils.process.calculate_norscale_inversion, on the GPU and started
+       from the DAS input's gain (GAIN_ON_GPU, INV_INIT)
     2. the band-pass, POST_FILTER_PARAMS             (process/freq_filter.py)
     3. the mute, DAS boundary from the deci sidecar  (process/rms_normalize.py)
     4. the streamer envelope gain back on            (process/logenv_process.py)
@@ -83,6 +85,7 @@ Edit the settings block, then run from the repository root:
     python -m inference.translate_das
 """
 
+import json
 import os
 import time
 
@@ -96,8 +99,7 @@ import utils.mute as MU
 from module.dataset_pohang_shore import PohangShoreDataset
 from network.pohang_shore_network_aniso import get_gen_model
 from utils.data import create_memmap, get_project_root
-from utils.process import (calculate_logscale, calculate_norscale_inversion,
-                           f_filter, f_filtering)
+from utils.process import calculate_logscale, f_filter, f_filtering
 
 # ---------------------------------------------------------------- settings --
 
@@ -135,10 +137,47 @@ POST_FILTER_PARAMS = dict(
 )
 PROBE_HZ = (5, 10, 20, 30, 50, 250, 300, 350, 400, 450)
 
-# Iterations of the gain inversion.  Measured against a gather whose gain
-# was applied and taken off again, the error relative to its peak is 6.1e-5
-# after 20 and 3.6e-7 after 50; 20 is about 2 s a shot, 50 about 6.
-INV_ITERATIONS = 20
+# Iterations of the gain inversion.  It is a fixed-point iteration that
+# closes the error by roughly 0.8x a step, with no stopping rule of its own.
+# Measured on raw translated shots (iden ep 150, shots 520-548) against 100-
+# and 200-iteration references, error relative to the peak on live samples:
+#
+#     iterations          10      20      30      40      50
+#     from scale 1 mean  3e-4    2e-5    1e-6    2e-7    1e-7
+#                  max   1e-1    1e-2    1e-3    6e-4    6e-4
+#     from INV_INIT mean 1e-4    6e-6    7e-7    3e-7    2e-7
+#                  max   2e-1    2e-2    3e-3    8e-4    1e-3
+#
+# Past about 40 both reach the same floor, set by float32 inside the gain,
+# and the starting point stops mattering.  50 is 0.18 s a shot on the GPU.
+INV_ITERATIONS = 50
+
+# Where the gain is fitted and inverted.  True runs the same arithmetic in
+# torch on DEVICE: 20 iterations of a 264-trace gather in 70 ms against
+# 2.6 s in numpy, and 20 numpy iterations were 23 minutes of post-processing
+# a checkpoint.  Against numpy the scale agrees to 7e-6 on live samples and
+# a 20-iteration inversion to 2e-5 of the peak, three decades inside the
+# inversion's own error.  False uses utils.process as it is.
+GAIN_ON_GPU = True
+
+# Starting point of the inversion.  "das" divides the output by the gain the
+# streamer parameters give the DAS INPUT of the same shot, which is close to
+# the answer because the output was translated from that input; None starts
+# from the log data itself, i.e. a gain of one.  "das" lowers the mean error
+# 2-4x at 10-20 iterations and nothing by 40 - see the table above - so it
+# earns its 1.16 GB cache only when the inversion runs on the CPU and the
+# iterations have to be few.  Where the DAS input is muted
+# its gain collapses to eps / log_base, and dividing the generator's
+# low-level texture there by that would blow it up a hundred-thousandfold -
+# and the envelope is a Hilbert transform, which carries that along the whole
+# trace - so the start is one there instead.
+INV_INIT = None
+
+# Cache for that starting gain, (shot, sample, receiver) in sorted shot order.
+# It depends only on the DAS input and the gain parameters, so every job and
+# every rerun shares it; it is rebuilt when the parameters in its sidecar do
+# not match.
+INIT_GAIN_NPY = os.path.join(C.DATA_DIR, "das_data_init_gain_str.npy")
 
 # Zeros in front of each shot gather while the gain is fitted or inverted.
 # Must match process/logenv_process.PAD_FRONT: the pad pins
@@ -274,17 +313,147 @@ def padded(g, n):
     return np.concatenate([np.zeros((n, g.shape[1])), g], axis=0)
 
 
-def invert_gain(g, lsp):
-    """The envelope gain off one shot gather."""
-    _, est = calculate_norscale_inversion(padded(g, GAIN_PAD_FRONT),
-                                          iterations=INV_ITERATIONS, **lsp)
-    return est[GAIN_PAD_FRONT:]
+class Gain:
+    """calculate_logscale and its inversion, in numpy or in torch.
+
+    The torch path is the same arithmetic as utils.process, step for step,
+    including where that code drops to float32: the envelope is cast to
+    float32 there, and everything after it until the division by the scale.
+    Logs and powers are taken in float64 and rounded, see `_log10`.  Two
+    differences that do not change the result: the Hilbert transform is a
+    1-D FFT along time, where hilbert_1d takes an FFT over both axes and the
+    trace-axis half cancels; and the Gaussian is applied as a separable
+    convolution with scipy's kernel (radius int(4 sigma + 0.5)) and its
+    "reflect" edge, d c b a | a b c d | d c b a.
+
+    Gathers come in padded - see `padded` - and the scale comes out padded.
+    """
+
+    def __init__(self, lsp, device=None):
+        self.lsp = dict(lsp)
+        if not self.lsp.get("is_1d_envelope", True):
+            raise SystemExit("only the 1-D envelope is implemented")
+        self.dev = None if device is None else torch.device(device)
+        if self.dev is not None:
+            sig = self.lsp["smooth_sigma"]
+            sig = (sig, sig) if np.isscalar(sig) else tuple(sig)
+            self.kernels = []
+            for sg in sig:
+                if sg <= 0:
+                    self.kernels.append(None)
+                    continue
+                r = int(4.0 * sg + 0.5)
+                x = np.arange(-r, r + 1, dtype=np.float64)
+                w = np.exp(-0.5 * (x / sg) ** 2)
+                self.kernels.append(
+                    (torch.tensor(w / w.sum(), device=self.dev).view(1, 1, -1),
+                     r))
+
+    # ---- torch
+    def _smooth(self, a):
+        for axis, k in enumerate(self.kernels):
+            if k is None:
+                continue
+            w, r = k
+            x = a if axis == 0 else a.T
+            if r >= x.shape[0]:
+                raise SystemExit(f"smoothing radius {r} exceeds axis {axis} "
+                                 f"length {x.shape[0]}")
+            xp = torch.cat([x[:r].flip(0), x, x[-r:].flip(0)], dim=0)
+            y = torch.nn.functional.conv1d(xp.T.unsqueeze(1), w)[:, 0].T
+            a = y if axis == 0 else y.T
+        return a
+
+    def _scale_t(self, d):
+        """calculate_logscale for a float64 tensor; float32 tensor out."""
+        nt = d.shape[0]
+        f = torch.fft.fftfreq(nt, dtype=torch.float64, device=self.dev)
+        filt = torch.complex(torch.zeros_like(f), torch.sign(f))
+        h = torch.fft.ifft(torch.fft.fft(d, dim=0) * filt[:, None], dim=0)
+        env = torch.sqrt(h * h + d * d).real.float()
+        env = env + self.lsp["log_base"]
+        el = self._log10(env)
+        el = el - el.min()
+        el = el + self.lsp["eps"]
+        sc = self._log10(el / env)
+        sc = self._smooth(sc.double()).float()
+        return torch.pow(10.0, sc.double()).float()
+
+    @staticmethod
+    def _log10(x):
+        # numpy's float32 log10 is correctly rounded; the GPU's is not, and
+        # `log10(env + log_base) - min` cancels wherever env << log_base, so
+        # one ulp there is tens of percent of the result.  Rounding a float64
+        # log brings the scale to within 8e-7 of numpy on every live sample.
+        return torch.log10(x.double()).float()
+
+    # ---- either
+    def scale(self, p):
+        if self.dev is None:
+            return calculate_logscale(p, **self.lsp)
+        t = torch.from_numpy(np.ascontiguousarray(p, dtype=np.float64))
+        return self._scale_t(t.to(self.dev)).cpu().numpy()
+
+    def apply(self, g):
+        """The gain on one unpadded gather."""
+        return g * self.scale(padded(g, GAIN_PAD_FRONT))[GAIN_PAD_FRONT:]
+
+    def invert(self, g, init=None):
+        """The gain off one unpadded gather, starting from `init` if given."""
+        y = padded(g, GAIN_PAD_FRONT)
+        if init is not None:
+            init = np.concatenate([np.ones((GAIN_PAD_FRONT, g.shape[1])),
+                                   init], axis=0)
+        if self.dev is None:
+            est = y / init if init is not None else y.copy()
+            for _ in range(INV_ITERATIONS):
+                est = y / calculate_logscale(est, **self.lsp)
+            return est[GAIN_PAD_FRONT:]
+        yt = torch.from_numpy(y).to(self.dev)
+        est = (yt / torch.from_numpy(init).to(self.dev) if init is not None
+               else yt.clone())
+        for _ in range(INV_ITERATIONS):
+            est = yt / self._scale_t(est)
+        return est[GAIN_PAD_FRONT:].cpu().numpy()
 
 
-def apply_gain(g, lsp):
-    """The envelope gain on, as process/logenv_process.logscale fits it."""
-    scale = calculate_logscale(padded(g, GAIN_PAD_FRONT), **lsp)
-    return g * scale[GAIN_PAD_FRONT:]
+def init_gain(gain, n_shot, n_samp, n_recv):
+    """The streamer-parameter gain of the DAS input, per shot, cached.
+
+    (shot, sample, receiver) in sorted shot order, one where the input is
+    muted - see INV_INIT.
+    """
+    path = resolve(INIT_GAIN_NPY)
+    side = os.path.splitext(path)[0] + "_meta.json"
+    want = dict(source=C.ARRAYS["das"]["norm"].replace("\\", "/"),
+                lsp={k: (list(v) if isinstance(v, tuple) else v)
+                     for k, v in gain.lsp.items()},
+                pad_front=GAIN_PAD_FRONT, shape=[n_shot, n_samp, n_recv])
+    if os.path.isfile(path) and os.path.isfile(side):
+        with open(side, "rt") as f:
+            have = json.load(f)
+        if have == want:
+            print(f"  initial gain from {INIT_GAIN_NPY}")
+            return np.load(path, mmap_mode="r")
+        print(f"  {INIT_GAIN_NPY} was built with other parameters; rebuilding")
+
+    das = np.load(resolve(C.ARRAYS["das"]["norm"]), mmap_mode="r")
+    if das.shape != (n_shot, n_samp, n_recv):
+        raise SystemExit(f"DAS norm is {das.shape}, expected "
+                         f"({n_shot}, {n_samp}, {n_recv})")
+    order = np.asarray(G.sorted_order()["orig_idx"], dtype=int)
+    out = create_memmap(path, (n_shot, n_samp, n_recv))
+    t0 = time.time()
+    for i in range(n_shot):
+        d = np.asarray(das[order[i]], dtype=np.float64)
+        sc = gain.scale(padded(d, GAIN_PAD_FRONT))[GAIN_PAD_FRONT:]
+        out[i] = np.where(d != 0, sc, 1.0).astype(np.float32)
+    out.flush()
+    del out
+    with open(side, "wt") as f:
+        json.dump(want, f, indent=1)
+    print(f"  built {INIT_GAIN_NPY} in {time.time() - t0:.0f}s")
+    return np.load(path, mmap_mode="r")
 
 
 class BandPass:
@@ -329,7 +498,7 @@ def mute_boundary(n_shot, n_recv):
     return t[order]
 
 
-def post_process(out, lsp, band, t_mute, dt_ms):
+def post_process(out, gain, band, t_mute, dt_ms, init=None):
     """Channel 1 holds the raw output on entry; both channels on exit."""
     n_shot = out.shape[1]
     sample_major = OUT_ORDER[1] == "sample"
@@ -337,12 +506,13 @@ def post_process(out, lsp, band, t_mute, dt_ms):
     for i in range(n_shot):
         g = np.asarray(out[1, i], dtype=np.float64)
         g = g if sample_major else g.T
-        g = invert_gain(g, lsp)
+        g = gain.invert(g, None if init is None
+                        else np.asarray(init[i], dtype=np.float64))
         if band is not None:
             g = band(g)
         if t_mute is not None:
             g = g * MU.weights(t_mute[i], g.shape[0], dt_ms)
-        log = apply_gain(g, lsp)
+        log = gain.apply(g)
         out[0, i] = (g if sample_major else g.T).astype(np.float32)
         out[1, i] = (log if sample_major else log.T).astype(np.float32)
         if (i + 1) % 50 == 0 or i + 1 == n_shot:
@@ -447,12 +617,15 @@ def main():
     shape = shape[tuple(OUT_ORDER)]
     if POST_PROCESS:
         shape = (2,) + shape
-        lsp = dict(C.LOG_SCALE_PARAMS[POST_LOG_TAG])
+        gain = Gain(C.LOG_SCALE_PARAMS[POST_LOG_TAG],
+                    DEVICE if GAIN_ON_GPU and DEVICE.startswith("cuda")
+                    else None)
         band = (None if POST_FILTER_PARAMS is None else
                 BandPass(POST_FILTER_PARAMS, n_samp, dt_ms / 1000.0))
         t_mute = mute_boundary(n_shot, n_recv) if POST_MUTE else None
         print(f"  post: {POST_LOG_TAG} gain off ({INV_ITERATIONS} iterations,"
-              f" {GAIN_PAD_FRONT} pad) -> "
+              f" {GAIN_PAD_FRONT} pad, start {INV_INIT or 'scale 1'}, on "
+              f"{gain.dev or 'cpu'}) -> "
               + ("band-pass" if band is not None else "no filter")
               + (" -> mute" if t_mute is not None else "")
               + " -> gain on;  channels (normal, log)")
@@ -460,6 +633,13 @@ def main():
             print(f"  band-pass {POST_FILTER_PARAMS}")
             print("  response  " + "  ".join(
                 f"{f:g} Hz {db:.1f} dB" for f, db in band.response(PROBE_HZ)))
+        init = (init_gain(gain, n_shot, n_samp, n_recv) if INV_INIT == "das"
+                else None)
+        if INV_INIT not in (None, "das"):
+            raise SystemExit(f"INV_INIT {INV_INIT!r} is not 'das' or None")
+        if init is not None and OUT_ORDER[1] != "sample":
+            raise SystemExit("INV_INIT 'das' needs OUT_ORDER (shot, sample, "
+                             "receiver)")
 
     for tag, epoch, key in JOBS:
         out_rel = C.ARRAYS["das"][key]
@@ -504,7 +684,7 @@ def main():
 
         if POST_PROCESS:
             print("  post-processing shot gathers")
-            post_process(out, lsp, band, t_mute, dt_ms)
+            post_process(out, gain, band, t_mute, dt_ms, init)
         out.flush()
         del out
         print(f"  wrote {out_rel}")
