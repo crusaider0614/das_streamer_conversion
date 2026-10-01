@@ -123,10 +123,11 @@ POST_MUTE = True
 # already filtered once with those, and this is a second pass over a
 # generator's output - the corners are a judgement made from its spectrum
 # (inference/plot_far_spectrum.py), not a property of the instrument.  The
-# values below are the input's own 20-300 Hz.  Applying the same mask twice
-# squares it near both corners, -0.9 dB at 20 Hz and -5.0 dB at 300 Hz
-# measured on white noise, against -29 dB at 5 Hz and -43 dB at 400 Hz.
-# The response at PROBE_HZ is printed at the start of a run.
+# values below are the input's own 20-300 Hz.  That mask is -6 dB at each
+# corner and falls steeply outside (-60 dB at 10 Hz, -150 dB at 350 Hz), so
+# a second pass with the same corners takes the corners to -12 dB in total -
+# move them outwards if the band edges should survive.  The mask's response
+# at PROBE_HZ is printed at the start of a run.
 POST_FILTER_PARAMS = dict(
     highpass=True, hp_f_cut=20.0, hp_order=1.0, hp_decay=1.0,
     lowpass=True, lp_f_cut=300.0, lp_order=0.5, lp_decay=0.5,
