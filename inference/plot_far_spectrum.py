@@ -1,7 +1,7 @@
 """Average amplitude spectra of the far-offset traces: DAS, translated, streamer.
 
     DAS          das_data_rg_{train,infer}.npy   or das_data_norm.npy
-    translated   das_data_fake_str.npy           whichever epoch translate_das.py wrote
+    translated   one or more files from translate_das.py, see FAKES
     streamer     str_data_rg_train.npy           or str_data_norm.npy
 
 Only traces at or beyond the far split - the streamer's own minimum offset,
@@ -24,14 +24,17 @@ DOMAIN
     "log"     every side as stored, in the log-envelope domain the generator
               works in.  Nothing is estimated.
     "normal"  the envelope gain off.  DAS and streamer come from their `norm`
-              files, which are exactly the data before the gain went on;
-              the translated side has its streamer gain taken back off with
-              calculate_norscale_inversion, PAD_FRONT zeros in front as in
-              process/logenv_process.py.  The streamer parameters smooth over
-              time only (sigma (5, 0)), so inverting just the traces used here
-              is the same as inverting the whole gather - which keeps "paired"
-              at about half a second a shot.  "all" inverts 264 traces a shot,
-              about six seconds, so raise SHOT_STEP for it.
+              files, which are exactly the data before the gain went on.
+
+The translated files come in two shapes.  translate_das.py with POST_PROCESS
+writes (2, shot, sample, receiver) - channel 0 normal, channel 1 log - and the
+channel matching DOMAIN is read directly, nothing estimated.  A 3-D file is
+the raw output in the log domain; in "normal" its streamer gain is taken back
+off with calculate_norscale_inversion, PAD_FRONT zeros in front as in
+process/logenv_process.py.  The streamer parameters smooth over time only
+(sigma (5, 0)), so inverting just the traces used here is the same as
+inverting the whole gather - about half a second a shot for "paired", six for
+"all", so raise SHOT_STEP for that.
 
 Spectra are averaged as power and drawn as amplitude in dB.  With
 PER_TRACE_NORM each trace's power spectrum is divided by its own total before
@@ -59,9 +62,16 @@ from utils.process import calculate_norscale_inversion
 
 # ---------------------------------------------------------------- settings --
 
-# Label for the translated curve - the file itself does not record which
-# checkpoint wrote it.
-FAKE_LABEL = "translated (ep 150)"
+# Translated files to draw, (key in C.ARRAYS["das"], label), one curve each.
+# The label is needed because the file does not record which checkpoint
+# wrote it.
+FAKES = (
+    ("fake_str_150", "iden ep 150"),
+    ("fake_str_m_inp_080", "iden_3 ep 80"),
+    ("fake_str_m_inp_140", "iden_3 ep 140"),
+)
+FAKE_COLOURS = ("tab:red", "tab:orange", "tab:green", "tab:purple",
+                "tab:brown")
 
 RECEIVERS = "paired"        # "paired" or "all"
 DOMAIN = "log"              # "log" or "normal"
@@ -132,7 +142,21 @@ class Sides:
 
     def __init__(self, order, inside, outside):
         self.order = order
-        self.fake_arr = load(C.ARRAYS["das"]["fake_str"], "translated")
+        self.fakes = []
+        for key, label in FAKES:
+            a = load(C.ARRAYS["das"][key], label)
+            if a.ndim == 4:
+                a = a[0 if DOMAIN == "normal" else 1]
+                self.fakes.append((a, False))
+            elif a.ndim == 3:
+                self.fakes.append((a, DOMAIN == "normal"))
+            else:
+                raise SystemExit(f"{key} is {a.shape}; expected 3-D or "
+                                 f"(2, shot, sample, receiver)")
+        self.fake_arr = self.fakes[0][0]
+        shapes = {a.shape for a, _ in self.fakes}
+        if len(shapes) > 1:
+            raise SystemExit(f"the translated files disagree: {shapes}")
         if DOMAIN == "log":
             self.rg = [load(C.ARRAYS["das"]["rg_train"], "DAS rg_train"),
                        load(C.ARRAYS["das"]["rg_infer"], "DAS rg_infer")]
@@ -158,9 +182,10 @@ class Sides:
             out[:, j] = block[self.row[cols[j]]].T
         return out
 
-    def fake(self, i, cols):
-        g = np.asarray(self.fake_arr[i][:, cols], np.float64)
-        if DOMAIN == "normal":
+    def fake(self, j, i, cols):
+        a, invert = self.fakes[j]
+        g = np.asarray(a[i][:, cols], np.float64)
+        if invert:
             g = invert_str(g)
         return g
 
@@ -230,7 +255,8 @@ def main():
     n_shot = sides.fake_arr.shape[0]
     n_t = window(np.zeros((sides.fake_arr.shape[1], 1))).shape[0]
     f = np.fft.rfftfreq(n_t, DT_MS / 1000.0)
-    acc = {k: Accum(len(f)) for k in ("das", "fake", "str")}
+    acc = {k: Accum(len(f)) for k in ["das", "str"] +
+           [f"fake{j}" for j in range(len(FAKES))]}
 
     shots = range(0, n_shot, SHOT_STEP)
     print(f"{RECEIVERS} receivers, {DOMAIN} domain, far >= {split:.2f} m, "
@@ -248,17 +274,18 @@ def main():
             s_cols = np.flatnonzero(far_s)
         if len(cols):
             acc["das"].add(window(sides.das(i, cols)))
-            acc["fake"].add(window(sides.fake(i, cols)))
+            for j in range(len(FAKES)):
+                acc[f"fake{j}"].add(window(sides.fake(j, i, cols)))
         if len(s_cols):
             acc["str"].add(window(sides.str(i)[:, s_cols]))
         if (n + 1) % 50 == 0:
             print(f"  {n + 1}/{len(shots)} shots", flush=True)
 
-    curves = {
-        "das": ("DAS input", "tab:blue", acc["das"].mean()),
-        "fake": (FAKE_LABEL, "tab:red", acc["fake"].mean()),
-        "str": ("streamer", "k", acc["str"].mean()),
-    }
+    curves = {"das": ("DAS input", "tab:blue", acc["das"].mean())}
+    for j, (_, label) in enumerate(FAKES):
+        curves[f"fake{j}"] = (label, FAKE_COLOURS[j % len(FAKE_COLOURS)],
+                              acc[f"fake{j}"].mean())
+    curves["str"] = ("streamer", "k", acc["str"].mean())
     band = f <= F_MAX_HZ
     for k, (name, _, p) in curves.items():
         print(f"  {name:22s} {acc[k].n:7d} traces   centroid "
@@ -281,7 +308,7 @@ def main():
     # Both against the streamer, each normalised to its total power first so
     # the ratio is a difference of spectral shape and not of overall level.
     ref = curves["str"][2] / curves["str"][2][band].sum()
-    for k in ("das", "fake"):
+    for k in [k for k in curves if k != "str"]:
         name, colour, p = curves[k]
         r = (p / p[band].sum()) / np.maximum(ref, 1e-30)
         ax1.plot(f[band], 10 * np.log10(np.maximum(r, 1e-30))[band],

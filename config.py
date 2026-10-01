@@ -86,6 +86,9 @@ ARRAYS = {
         # inference/translate_das.py.  In the streamer log-envelope domain -
         # inference/plot_translated_shots.py takes that gain off again.
         "fake_str": os.path.join(DATA_DIR, "das_data_fake_str.npy"),
+        "fake_str_150": os.path.join(DATA_DIR, "das_data_fake_str_150.npy"),
+        "fake_str_m_inp_080": os.path.join(DATA_DIR, "das_data_fake_str_m_inp_080.npy"),
+        "fake_str_m_inp_140": os.path.join(DATA_DIR, "das_data_fake_str_m_inp_140.npy"),
     },
     "str": {
         "raw": os.path.join(NPY_DIR, "str_data_raw.npy"),
