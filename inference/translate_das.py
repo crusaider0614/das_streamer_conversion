@@ -67,7 +67,7 @@ from utils.data import create_memmap, get_project_root
 # ---------------------------------------------------------------- settings --
 
 CONFIG = os.path.join("config", "pohang_shore_das_str_cut.yaml")
-EPOCH = 150
+EPOCH = 140
 
 # Where the result goes, relative to the project root.
 OUT_NPY = C.ARRAYS["das"]["fake_str"]
@@ -119,7 +119,7 @@ BATCH = 4
 # training config names GPUS [4, 5, 6, 7] and the older test script hard-codes
 # cuda:9.  So the index is written out.  None runs on the CPU, which works
 # but is slow: the FID's Inception dominates everything there.
-GPU = 0
+GPU = 4
 DEVICE = (f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available()
           else "cpu")
 

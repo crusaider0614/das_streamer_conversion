@@ -34,7 +34,7 @@ def show_four(panels, names=("real A", "fake B", "real B", "same B"), clip=1.0):
     plt.show()
 
 
-epoch = 120
+epoch = 80
 
 # Define
 config_file = os.path.join(get_project_root(), "config", "pohang_shore_das_str_cut.yaml")
@@ -86,7 +86,7 @@ with torch.no_grad():
     real_A_imgs = None
     real_B_imgs = None
     fake_imgs = None
-    for (real_A_image, real_B_image) in zip(A_loader, B_loader):
+    for (i, (real_A_image, real_B_image)) in enumerate(zip(A_loader, B_loader)):
         real_A_image = real_A_image.to(device)
         real_B_image = real_B_image.to(device)
 

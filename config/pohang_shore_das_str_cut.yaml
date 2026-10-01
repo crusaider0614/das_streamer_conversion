@@ -1,11 +1,11 @@
-TAG: "pohang_shore_das_str_cut_iden_2"
+TAG: "pohang_shore_das_str_cut_iden_3"
 CUDNN_BENCHMARK: True
 SEED: 19467
 DEVICE: "cuda"
-GPUS: [ 0, 1, 2, 3 ]
+GPUS: [ 5, 6, 7, 9 ]
 
 PRETRAIN:
-  LOAD: True
+  LOAD: False
   TAG: "pohang_shore_das_str_cut_iden"
   LOAD_EPOCH: 150
   LOAD_OPTIMIZER: True
